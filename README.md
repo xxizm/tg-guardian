@@ -1,0 +1,217 @@
+# TG Guardian — Telegram 账号安全守护机器人
+
+作者：TG https://t.me/ziixiix
+
+一个帮你看住 Telegram 账号的守护机器人。有人在别处登录你的账号、或者有人拿到你的验证码想登录时，它会立刻在 Telegram 上提醒你，你可以在机器人里一键同意、或者一键踢掉对方并冻结登录。
+
+## 它能做什么
+
+- **新设备登录提醒**：你的账号在新设备上登录时，机器人马上发提醒，显示设备、应用、地点、IP 和时间，你点“是我本人”放行，点“踢掉”就把那个会话注销掉。10 分钟没反应，它自动帮你踢掉。
+- **验证码提醒（防半登录）**：有人请求了你的登录验证码（777000 的消息），机器人马上提醒你。验证码本身就是一次“半登录”，点“同意”放行，点“拒绝”就冻结。
+- **冻结验证码**：拒绝后，监控端用那个验证码连续输错 5 次，让这个验证码失效，对方拿着验证码也登不进来。
+- **Flood 保护（冻结二级密码）**：拒绝后，监控端连续输错 5 次二级密码，触发 Telegram 的登录次数限制（Flood），在一段时间内谁也登不进这个账号——包括你自己。已经登录的设备不受影响。
+- **持续 Flood 保护**：定时触发一次 Flood 保护，可以只触发一次、每隔一段时间循环触发、或者触发指定次数后停止。
+- **多账号**：一个机器人可以同时看住你名下的多个 Telegram 账号（共用一个 API ID / Hash）。
+- **改账号显示名**：机器人里显示的账号名字可以自定义（`/rename_account`），名字不能重复。
+- **自检与状态**：`/status` 看账号和会话，`/devices` 看设备列表，`/security_check` 做安全检查，`/flood_status` 看 Flood 状态。
+
+## 架构
+
+```
+你的 Telegram 账号 ──(MTProto)──► 监控端（monitor/main.py，跑在你自己的服务器上）
+                                          │
+                                          │ 每 120 秒轮询一次
+                                          ▼
+                             Cloudflare Worker（worker.js）＋ KV
+                                          │
+                                          │ Telegram Bot API
+                                          ▼
+                              守护机器人（@你的机器人）
+```
+
+- **Worker**：Cloudflare 上的管理机器人，负责收发消息、按钮、命令，状态存在 Cloudflare KV 里。
+- **监控端**：一台服务器上跑的 Python 程序（Telethon / MTProto），用你自己的 Telegram 账号登录，负责检测新设备和验证码、执行注销和冻结。
+- Worker 不能主动推给监控端，所以监控端每 120 秒问一次 Worker“有没有新指令”，你的按钮操作最慢 2 分钟生效（决定类操作会走唤醒消息，一般 2–5 秒就执行）。
+
+## 快速开始
+
+### 1. 准备工作
+
+你需要：
+
+- 一个 Telegram 账号（要被守护的账号）。
+- 一台能长期运行 Python 的服务器（VPS、家里的电脑、树莓派都行，Python 3.10 以上）。
+- 一个 Cloudflare 账号（免费版就够）。
+
+### 2. 创建 Telegram 机器人
+
+1. 在 Telegram 里打开 [@BotFather](https://t.me/BotFather)，发 `/newbot`，按提示起个名字和用户名。
+2. 记下它给你的 **BOT_TOKEN**（一长串 `数字:字母`）。
+3. 再去 [@userinfobot](https://t.me/userinfobot) 发任意消息，它会告诉你自己的 Telegram 用户 ID，记下这个 **OWNER_ID**（一串数字）。
+
+### 3. 申请 Telegram API ID / Hash
+
+1. 打开 https://my.telegram.org，用你的 Telegram 账号登录。
+2. 点 **API development tools**，填一个应用名（随便填，比如 `tg-guardian`），平台选 Desktop，其他留空，点创建。
+3. 记下 **API_ID**（数字）和 **API_HASH**（字符串）。这两个只标识“你的应用”，不标识账号，多个账号共用同一份。
+
+### 4. 部署 Cloudflare Worker
+
+1. 登录 Cloudflare Dashboard → **Workers & Pages** → **Create** → 选 **Worker**，起个名字（比如 `tg-guardian`），点 **Deploy**。
+2. 点 **Edit code**，把本仓库根目录的 `worker.js` 全部内容粘贴进去，点 **Deploy**。
+3. 创建 KV 命名空间：左侧 **Workers & Pages** → **KV** → **Create a namespace**，名字填 `TG_GUARD_DATA`。
+4. 绑定 KV：回到你的 Worker → **Settings** → **Variables** → **KV Namespace Bindings** → **Add binding**，变量名填 `TG_GUARD_DATA`，选刚才创建的命名空间，点 **Deploy**。
+5. 设置环境变量（同一页 **Variables** → **Environment Variables**，点 **Add variable**）：
+   - `BOT_TOKEN`：第 2 步得到的机器人 token。
+   - `OWNER_ID`：第 2 步得到的你的用户 ID。
+   - `WEBHOOK_SECRET`：自己随便想一个随机字符串（比如用密码生成器生成 32 位），后面设置 webhook 时要用同一个。
+   - 点 **Deploy** 保存。
+6. 设置 webhook（让 Telegram 把消息推给 Worker）。把下面这条命令里的三处换成你自己的值，在终端里执行一次：
+   ```bash
+   curl "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook?url=https://<你的Worker地址>/webhook&secret_token=<WEBHOOK_SECRET>"
+   ```
+   你的 Worker 地址形如 `https://tg-guardian.<你的子域名>.workers.dev`（子域名在 Cloudflare Dashboard 的 Workers 页面能看到）。
+   返回 `{"ok":true,...}` 就是成功。
+7. 验证：打开 `https://<你的Worker地址>/`，应该看到 `{"ok":true,"service":"TG Guardian","version":"1.4.17",...}`，并且 `checks` 里的 `BOT_TOKEN`、`OWNER_ID`、`WEBHOOK_SECRET`、`TG_GUARD_DATA`、`KV_PUT`、`KV_GET` 全是 `true`。然后去 Telegram 给机器人发 `/start`，它应该回你菜单。
+
+### 5. 部署监控端
+
+1. 把本仓库克隆到你的服务器：
+   ```bash
+   git clone https://github.com/<你的用户名>/tg-guardian.git
+   cd tg-guardian/monitor
+   pip install -r requirements.txt
+   ```
+2. 设置环境变量（见下面的变量表，必填的 6 个）：
+   ```bash
+   export API_ID="你的 API ID"
+   export API_HASH="你的 API Hash"
+   export BOT_TOKEN="你的机器人 token"
+   export OWNER_ID="你的用户 ID"
+   export PHONE="+8613800138000"        # 主账号手机号，带国家码
+   export WORKER_URL="https://tg-guardian.<你的子域名>.workers.dev"
+   ```
+   建议把这些写进一个 `.env` 文件或者系统的服务配置里，不要写进代码、不要提交到 Git。
+3. 启动：
+   ```bash
+   python3 -u main.py
+   ```
+   第一次启动没有会话文件，它会在终端里问你要手机号和验证码（Telegram 发来的登录验证码），照着输就行。登录成功后会生成会话文件（`tg_guardian.session`），以后启动就不用再登录了。
+   - 如果你不想交互登录，可以先用 Telethon 生成一个 `SESSION_STRING`（会话字符串），设到环境变量里，监控端启动时直接用它登录。
+4. 验证：机器人应该给你发一条“监控端已启动”的提醒，`/status` 能看到主账号的会话数。日志里出现 `TG Guardian MTProto monitor v0.5.16 started as ...` 就是正常启动。
+
+### 6. 添加账号
+
+主账号是启动时用 `PHONE` 指定的那个。想再加账号，在机器人里发：
+
+```
+/add_account +8613800138000 小号
+```
+
+然后按提示操作：
+
+```
+/code 12345        # 填 Telegram 发给那个账号的验证码
+/2fa 你的二级密码    # 那个账号如果开了二级密码才需要
+```
+
+加完后 `/accounts` 能看到所有账号。想删账号：`/remove_account +8613800138000`，再发一次带 `确认`。
+
+想改机器人里显示的名字：
+
+```
+/rename_account 0968 小号
+```
+
+名字是自定义的显示名，不会改你的 Telegram 账号本身的名字，名字不能和别的账号重复。
+
+### 7. 常用命令
+
+| 命令 | 说明 |
+| --- | --- |
+| `/status` | 看账号、会话和 Flood 状态 |
+| `/devices` | 看设备列表 |
+| `/logs` | 看最近的提醒记录 |
+| `/login_guard` | 看登录保护和持续 Flood 保护的状态 |
+| `/flood_status` | 看 Flood 状态和预计恢复时间 |
+| `/security_check` | 安全自检 |
+| `/accounts` | 账号列表 |
+| `/add_account <手机号> [名字]` | 添加一个账号 |
+| `/code <验证码>` | 完成添加账号时的验证码 |
+| `/2fa <二级密码>` | 完成添加账号时的二级密码 |
+| `/cancel_add <手机号>` | 取消正在添加的账号 |
+| `/remove_account <手机号>` | 删除一个账号（要确认两次） |
+| `/rename_account [手机号或名字] <新名字>` | 改机器人里显示的账号名字 |
+| `/set_guard <秒>` | 验证码提醒后多久无操作自动冻结（60–3600 秒） |
+| `/set_revoke <秒>` | 新设备提醒后多久无操作自动注销（60–3600 秒） |
+| `/alert_on [账号]` / `/alert_off [账号]` | 开 / 关提醒弹窗（只关弹窗，保护照常运行） |
+| `/clear_alerts [账号]` | 清空提醒记录 |
+| `/clear_flood [账号]` | 手动清除一条 Flood 记录 |
+| `/check_flood [账号]` | 手动探测 Flood 是不是已经解除了 |
+| `/sustain_flood_on [分钟] [账号]` | 开启持续 Flood 保护（默认 30 分钟，最长 1440 分钟） |
+| `/sustain_flood_off [账号]` | 关闭持续 Flood 保护 |
+| `/help` | 帮助 |
+
+持续 Flood 保护的三种模式（设好时间后，在机器人弹出的按钮里选）：
+
+- **只触发一次**（默认）：到时间触发一次 Flood 保护，然后自动关闭。
+- **🔁 循环**：每隔你设定的时间触发一次，一直循环，直到你用 `/sustain_flood_off` 关掉。
+- **🔢 选择次数**：每隔你设定的时间触发一次，触发 1 / 3 / 5 / 10 次后自动停止。
+
+## 环境变量表
+
+### Worker（Cloudflare 侧）
+
+| 变量名 | 类型 | 说明 | 重要程度 |
+| --- | --- | --- | --- |
+| `BOT_TOKEN` | 字符串 | Telegram 机器人的 token（@BotFather 创建机器人后得到） | 必填 |
+| `OWNER_ID` | 整数 | 你的 Telegram 用户 ID（只有这个 ID 能用机器人，其他人发消息会被忽略） | 必填 |
+| `WEBHOOK_SECRET` | 字符串 | Webhook 密钥，自己随便设一个随机字符串；设置 webhook 时 `secret_token` 要填同一个 | 必填 |
+| `TG_GUARD_DATA` | KV 命名空间绑定 | Cloudflare KV 命名空间，用来存账号、待处理事项、提醒记录 | 必填 |
+
+### 监控端（服务器侧）
+
+| 变量名 | 类型 | 说明 | 重要程度 |
+| --- | --- | --- | --- |
+| `API_ID` | 整数 | Telegram API ID（my.telegram.org 申请） | 必填 |
+| `API_HASH` | 字符串 | Telegram API Hash（同上） | 必填 |
+| `BOT_TOKEN` | 字符串 | 和 Worker 填同一个机器人 token | 必填 |
+| `OWNER_ID` | 整数 | 和 Worker 填同一个你的用户 ID | 必填 |
+| `PHONE` | 字符串 | 主账号手机号，带国家码，如 `+8613800138000` | 必填 |
+| `WORKER_URL` | 字符串 | 你的 Worker 地址，如 `https://tg-guardian.<你的子域名>.workers.dev` | 必填 |
+| `SESSION_STRING` | 字符串 | Telethon 会话字符串；填了它启动时就不用交互登录 | 可选 |
+| `CHECK_INTERVAL` | 整数（秒） | 每隔多久检查一次授权会话，默认 300 | 可选 |
+| `POLL_INTERVAL` | 整数（秒） | 每隔多久问一次 Worker 有没有新指令，默认 120 | 可选 |
+| `AUTO_REVOKE_AFTER` | 整数（秒） | 新设备提醒后多久无操作自动注销，默认 600 | 可选 |
+| `AUTO_CODE_AFTER` | 整数（秒） | 验证码提醒后多久无操作自动冻结，默认 300 | 可选 |
+| `HEARTBEAT_INTERVAL` | 整数（秒） | 每隔多久上传一次设备快照（心跳），默认 3600 | 可选 |
+| `STATE_FILE` | 字符串 | 状态文件路径，默认 `devices.json` | 可选 |
+
+## 脱敏说明
+
+这个仓库是开源版，里面没有任何真实密钥和个人信息。脱敏的地方一共就这几处：
+
+| 脱敏项 | 开源版的样子 | 你需要做的事 |
+| --- | --- | --- |
+| `monitor/main.py` 里的 `WORKER_URL` 默认值 | 原来是我自己的 Worker 地址，已改成占位符 `https://your-worker.your-subdomain.workers.dev` | 改成你自己部署的 Worker 地址，或者设环境变量 `WORKER_URL` |
+| 所有密钥和账号信息（`BOT_TOKEN`、`OWNER_ID`、`WEBHOOK_SECRET`、`API_ID`、`API_HASH`、`PHONE`） | 本来就不在代码里，全部走环境变量 | 按上面的变量表填你自己的值，不要写进代码、不要提交到 Git |
+| 会话文件（`tg_guardian.session`、`tg_guardian_<手机号>.session`） | 不在仓库里 | 第一次启动监控端时自动生成，`.gitignore` 已排除，绝不要提交 |
+| 作者名 | 统一改成 TG https://t.me/ziixiix | 不用改 |
+
+除此之外代码和我自己用的完全一样，没有删功能、没有留后门。
+
+## 安全提醒
+
+- **会话文件就是你的 Telegram 登录态**。`tg_guardian.session` 和 `tg_guardian_<手机号>.session` 一定要保管好，绝不要发给别人、不要提交到 Git、不要上传到公开的地方。丢了它就等于丢了账号。
+- **不要用 tdata**。tdata 是 Telegram 的登录密钥文件，导入它等于直接登录，没有验证码、没有二级密码，监控也发现不了。请只用本项目自己的会话文件。
+- **不要在 Telegram 里点“注销所有其它设备上的会话”**。监控端自己的会话也在里面，注销了它监控就断了，得重新授权。只单独注销你不认识的会话。
+- **监控端会话不满 24 小时不能注销别的会话**。这是 Telegram 的限制（FRESH_RESET_AUTHORISATION_FORBIDDEN），不是 bug。刚部署好的一天内，新的半登录只能靠你手动在 Telegram 里结束。
+- **Flood 保护会把你自己也锁在外面**。它触发后的一段时间内（通常约 1 小时），这个手机号收不到登录验证码、登不进新设备，已经登录的设备不受影响。用之前想清楚，持续 Flood 保护不要设得太频繁。
+- **验证码和二级密码只在机器人和 KV 里短暂经过**。添加账号时，验证码/二级密码从机器人发到 Worker 的 KV，监控端下一次轮询（最多 2 分钟）取走后 Worker 立刻删掉，监控端只在内存里用一次，绝不写日志。
+- **机器人只认 OWNER_ID**。不是你的用户 ID 发来的消息和按钮，机器人一律不理。
+
+## 开源协议
+
+MIT License，详见 [LICENSE](LICENSE)。
+
+作者：TG https://t.me/ziixiix
