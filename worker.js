@@ -2,6 +2,7 @@
  * TG Guardian Worker v1.4.18
  * Cloudflare Worker + KV (TG_GUARD_DATA) + Telegram Bot API.
  * Env: BOT_TOKEN, OWNER_ID, WEBHOOK_SECRET, KV binding TG_GUARD_DATA.
+ * Author: TG https://t.me/ziixiix
  *
  * MULTI-ACCOUNT (v1.4.0): one bot watches several Telegram accounts that
  * all belong to the same owner. Every account has its own phone number;
