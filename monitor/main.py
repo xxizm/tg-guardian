@@ -1,5 +1,5 @@
 """
-TG Guardian MTProto Monitor v0.5.16
+TG Guardian MTProto Monitor v0.5.17
 Author: TG https://t.me/ziixiix
 开源版说明：代码里没有任何真实密钥，所有配置都走环境变量；WORKER_URL 的默认值是占位符，部署时改成你自己的 Worker 地址。会话文件（*.session）不在仓库里，第一次启动时自动生成。
 - v0.5.6: “二级密码保护”全部改称 Flood保护。
@@ -8,6 +8,7 @@ Author: TG https://t.me/ziixiix
 - v0.5.11: 冻结用的临时会话在冻结完就退出登录，不再留在设备列表里当新设备提醒，也不再触发面板记录的误删；免验证码路径每次输错前都重新取一次密码参数（修 Invalid SRP ID 中断）。
 - v0.5.12: 误报修正：要新验证码时若已处二级密码洪水（PHONE_PASSWORD_FLOOD），报已触发而不是失败；免验证码路径取密码参数时遇洪水也认作已触发；验证码请求洪水和二级密码洪水两种错误分开报。
 - v0.5.13: 2FA 进行中提示改成“正在处理，过程中如果再收到验证码消息，忽略即可”；恢复时间估算由 24 小时改成 1 小时（多次实测都约 1 小时恢复）。
+- v0.5.17: /check_flood 手动探测不再看有没有记录——有手动指令就发一次验证码实测；探测能分清“确实还在洪水里”（FloodWait / PHONE_PASSWORD_FLOOD / PHONE_NUMBER_FLOOD）和“探测失败”，并把结果（flood_active、wait_seconds）报给 Worker，让面板按实测更新。
 - v0.5.16: 持续Flood保护加循环/次数模式：定时器到时间后按模式重排（循环一直触发，次数模式触发 N 次后停），重排后按新时间再触发；结果提醒里写下次触发时间和剩余次数；/rename_account 改名后监控端从账号列表同步新名字。
 - v0.5.15: 持续Flood保护：/sustain_flood_on [分钟] 开启一次性定时触发（默认 30 分钟，最长 1440 分钟），/sustain_flood_off 关闭，默认关；到时间监控端自动触发一次 Flood 保护并上报结果，触发后定时器自动清除。
 - v0.5.14: 轮询改成 120 秒（唤醒消息直接带决定，轮询只是兜底；设置 2 分钟内生效）；恢复时间估算改按 24 小时内触发次数（前 3 次 1 小时，第 4 次 6 小时，第 5 次起 24 小时），用 Worker 在 /code-freeze 返回的估算，拿不到时才用本地 1 小时。
@@ -182,7 +183,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("tg-guardian-mtproto")
 
-VERSION = "v0.5.16"
+VERSION = "v0.5.17"
 
 def norm_phone(p) -> str:
     """Digits-only phone. The Worker normalizes phones to digits-only,
@@ -1423,13 +1424,15 @@ async def probe_flood(acct: Acct) -> dict:
     """Manual flood check (/check_flood): ask Telegram for a login code
     on a throwaway client and see whether it is refused. A successful
     code request proves the flood has lifted (auth.sendCode itself
-    returns the flood error while one is active); a FloodWaitError
-    proves it has not. Never enters any password, so a probe can never
+    returns the flood error while one is active); a flood error
+    (FloodWait / PHONE_PASSWORD_FLOOD / PHONE_NUMBER_FLOOD) proves it
+    has not. The result also says whether the flood is definitely active
+    (flood_active) and the real wait in seconds when Telegram gives one. Never enters any password, so a probe can never
     trigger a flood — it only spends one code request. The probe's own
     code message is swallowed by the capture flag (digits discarded,
     message marked seen) so it never alerts the owner."""
     phone = acct.phone
-    result = {"lifted": False, "detail": ""}
+    result = {"lifted": False, "detail": "", "flood_active": False, "wait_seconds": None}
     client2 = None
     try:
         client2 = TelegramClient(f"tg_guardian_probe_{phone}", int(API_ID), API_HASH)
@@ -1441,7 +1444,15 @@ async def probe_flood(acct: Acct) -> dict:
             result["lifted"] = True
             result["detail"] = "\u9a8c\u8bc1\u7801\u5df2\u9001\u8fbe"
         except FloodWaitError as exc:
-            result["detail"] = f"\u9650\u6d41 {exc.seconds} \u79d2"
+            result["flood_active"] = True
+            result["wait_seconds"] = int(exc.seconds) if exc.seconds else None
+            result["detail"] = f"限流 {exc.seconds} 秒"
+        except PhonePasswordFloodError:
+            result["flood_active"] = True
+            result["detail"] = "密码洪水限制中"
+        except PhoneNumberFloodError:
+            result["flood_active"] = True
+            result["detail"] = "验证码请求受限"
         # Give the probe's own code message a few seconds to arrive so
         # the handler swallows it instead of alerting on it.
         for _ in range(8):
@@ -1566,6 +1577,8 @@ async def process_flood_probe(acct: Acct, data: dict) -> None:
         "account": acct.phone,
         "lifted": result["lifted"],
         "detail": result["detail"],
+        "flood_active": result.get("flood_active", False),
+        "wait_seconds": result.get("wait_seconds"),
         "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     })
     log.warning("[%s] Flood probe result: lifted=%s (%s).", acct.phone, result["lifted"], result["detail"])

@@ -1,9 +1,7 @@
 /**
- * TG Guardian Worker v1.4.17
- * Author: TG https://t.me/ziixiix
+ * TG Guardian Worker v1.4.18
  * Cloudflare Worker + KV (TG_GUARD_DATA) + Telegram Bot API.
  * Env: BOT_TOKEN, OWNER_ID, WEBHOOK_SECRET, KV binding TG_GUARD_DATA.
- * 开源版说明：所有密钥都走环境变量，代码里没有任何真实密钥；部署时按 README 的变量表填好自己的值。
  *
  * MULTI-ACCOUNT (v1.4.0): one bot watches several Telegram accounts that
  * all belong to the same owner. Every account has its own phone number;
@@ -151,9 +149,19 @@
  * The sustain record carries mode/remaining/total; POST /code-freeze
  * reschedules a loop timer or decrements a count timer, and returns the
  * updated sustain state for the result alert.
+ *
+ * MANUAL PROBE ALWAYS PROBES (v1.4.18): /check_flood no longer refuses
+ * when there is no stored flood record - a manual check always sends one
+ * fresh code request and reports the real state. When the probe finds a
+ * definite flood (FloodWait / PHONE_PASSWORD_FLOOD / PHONE_NUMBER_FLOOD)
+ * with no stored record, the Worker creates one (mode 2fa, recovery from
+ * the real FloodWait seconds when Telegram gives them, else unknown) so
+ * the panel stops lying; with a stored record the real wait overwrites
+ * the estimate. A failed/inconclusive probe changes nothing. An old
+ * monitor (no flood_active field) keeps the previous behaviour.
  */
 
-const VERSION = "1.4.17";
+const VERSION = "1.4.18";
 
 // Wake-up marker (v1.4.9): sent as a short bot message after any decision
 // button tap so the monitor polls /pending immediately instead of waiting
@@ -418,7 +426,7 @@ const HELP_TEXT =
   "/alert_off — 关闭安全异常告警\n" +
   "/clear_alerts — 手动清空最近告警\n" +
 "/clear_flood — 手动清除已记录的 Flood 状态\n" +
-"/check_flood — 手动检查 Flood 是否已恢复\n\n" +
+"/check_flood — 手动检查 Flood 是否已恢复（会发一次验证码来实测，收到后忽略即可）\n\n" +
   "⏱️ 时间设置（60–3600 秒，改完 2 分钟内生效）\n" +
   "/set_guard <秒> [账号] — 验证码无人确认后自动冻结二级密码的时间\n" +
   "/set_revoke <秒> [账号] — 新设备无人确认后自动注销的时间\n\n" +
@@ -1220,7 +1228,7 @@ out += `最近一次保护：${what}\n` +
 `触发时间：${fmtTime(f.frozen_at)}\n` +
 (f.flood_count ? `触发次数（24 小时内）：第 ${f.flood_count} 次\n` : "") +
 (ct || tt? `预计恢复：${rec? fmtTime(rec): "未知"}\n` +
-`当前状态：${inWindow? "限制中": "已过预计恢复时间"}\n`: `当前状态：未触发限制\n`) +
+`当前状态：${!rec ? "限制中（恢复时间未知）" : inWindow ? "限制中" : "已过预计恢复时间"}\n`: `当前状态：未触发限制\n`) +
 `验证码输错：${f.attempts || 0} 次\n` +
 (f.twofa_outcome? `Flood保护：${shortTwofaOutcome(f)}。\n`: "") +
 (f.outcome? `结果：${f.outcome}\n`: "");
@@ -1300,12 +1308,10 @@ const res = await resolveAccountArg(env, args);
 if (res.none) return sendMessage(env, chatId, "👥 还没有账号。发 /add_account <手机号> [名字] 添加第一个账号。", true);
 if (res.error) return sendMessage(env, chatId, res.error, true);
 if (res.needChoice) return sendMessage(env, chatId, choiceText(res.accounts) + `\n用法：${cmd} <手机号或名字>`, true);
-const f = await frozenInfo(env, res.account.phone);
-if (!f) return sendMessage(env, chatId, `📋 账号【${accountLabel(res.account)}】没有已记录的 Flood，不用检查。`, true);
 const existing = await kvGetAcct(env, res.account.phone, "flood_probe");
 if (existing) return sendMessage(env, chatId, `🔍 账号【${accountLabel(res.account)}】已经在检查了，稍等，结果会通知你。`, true);
 await kvPutAcct(env, res.account.phone, "flood_probe", JSON.stringify({ requested_at: new Date().toISOString() }));
-return sendMessage(env, chatId, `🔍 已安排检查账号【${accountLabel(res.account)}】的 Flood 状态，监控端 1 分钟内开始探测，结果会通知你。\n\n检查时会请求一个验证码，收到后忽略即可。`, true);
+return sendMessage(env, chatId, `🔍 已安排检查账号【${accountLabel(res.account)}】的 Flood 状态，监控端 2 分钟内开始探测，结果会通知你。\n\n检查时会请求一个验证码，收到后忽略即可。`, true);
 }
 if (cmd === "/set_guard" || cmd === "/set_revoke") {
 // Accept seconds and account in either order: /set_guard 300,
@@ -1689,10 +1695,44 @@ await kvDeleteAcct(env, phone, "code_frozen");
 await appendAlert(env, phone, `[${new Date().toISOString()}] Flood保护已恢复（手动检查）`);
 ctx.waitUntil(sendMessage(env, env.OWNER_ID, `✅ TG Guardian【${label}】：Flood保护已恢复。`));
 } else {
+const waitSec = Number(body.wait_seconds);
+const hasWait = Number.isFinite(waitSec) && waitSec > 0;
+const nowMs = Date.now();
+const nowIso = new Date(nowMs).toISOString();
+if (body.flood_active === true) {
+let rec = await frozenInfo(env, phone);
+if (rec && !rec.broken) {
+if (hasWait) {
+rec.expected_recovery_at = new Date(nowMs + waitSec * 1000).toISOString();
+await kvPutAcct(env, phone, "code_frozen", JSON.stringify(rec));
+}
+} else {
+rec = {
+event_id: `probe:${phone}:${Math.floor(nowMs / 1000)}`,
+frozen_at: nowIso,
+expected_recovery_at: hasWait ? new Date(nowMs + waitSec * 1000).toISOString() : "",
+mode: "2fa",
+attempts: 0,
+outcome: "仍在限制中（手动检查）",
+twofa_attempts: 0,
+twofa_outcome: "已触发（手动检查）",
+triggered: true,
+twofa_triggered: true,
+};
+await kvPutAcct(env, phone, "code_frozen", JSON.stringify(rec));
+}
+const recTime = rec && rec.expected_recovery_at ? fmtTime(rec.expected_recovery_at) : "未知";
+await appendAlert(env, phone, `[${nowIso}] Flood检查：仍在限制中（${body.detail || ""}）`);
+ctx.waitUntil(sendMessage(env, env.OWNER_ID, `🌊 TG Guardian【${label}】：Flood保护还在限制中，预计恢复 ${recTime}。`));
+} else if (body.flood_active === false) {
+await appendAlert(env, phone, `[${nowIso}] Flood检查失败（${body.detail || ""}）`);
+ctx.waitUntil(sendMessage(env, env.OWNER_ID, `⚠️ TG Guardian【${label}】：Flood 检查失败（${body.detail || "未知原因"}），没有改动记录，稍后再试。`));
+} else {
 const f = await frozenInfo(env, phone);
-const rec = f && f.expected_recovery_at? fmtTime(f.expected_recovery_at): "未知";
-await appendAlert(env, phone, `[${new Date().toISOString()}] Flood检查：仍在限制中（${body.detail || ""}）`);
+const rec = f && f.expected_recovery_at ? fmtTime(f.expected_recovery_at) : "未知";
+await appendAlert(env, phone, `[${nowIso}] Flood检查：仍在限制中（${body.detail || ""}）`);
 ctx.waitUntil(sendMessage(env, env.OWNER_ID, `🌊 TG Guardian【${label}】：Flood保护还在限制中，预计恢复 ${rec}。`));
+}
 }
 return Response.json({ ok: true});
 }
