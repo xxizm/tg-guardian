@@ -1,5 +1,5 @@
 /**
- * TG Guardian Worker v1.4.20
+ * TG Guardian Worker v1.4.21
  * Cloudflare Worker + KV (TG_GUARD_DATA) + Telegram Bot API.
  * Env: BOT_TOKEN, OWNER_ID, WEBHOOK_SECRET, KV binding TG_GUARD_DATA.
  * Author: TG https://t.me/ziixiix
@@ -173,9 +173,12 @@
  * valid). The monitor's PHONE env var must be updated to the new number
  * too, then the monitor restarted, so its session mapping still resolves
  * to the existing session file.
+ *
+ * HELP (v1.4.21): /change_phone is now listed in /help (account
+ * management section).
  */
 
-const VERSION = "1.4.20";
+const VERSION = "1.4.21";
 
 // Wake-up marker (v1.4.9): sent as a short bot message after any decision
 // button tap so the monitor polls /pending immediately instead of waiting
@@ -435,6 +438,7 @@ const HELP_TEXT =
   "/accounts — 账号列表和状态\n" +
   "/add_account <手机号> [名字] — 添加一个账号\n" +
   "/rename_account [手机号或名字] <新名字> — 改账号名字\n" +
+  "/change_phone <旧手机号> <新手机号> — 在 Telegram 换了号码后，把记录迁到新号码\n" +
   "/code <验证码> — 添加账号时提交验证码\n" +
   "/2fa <二级密码> — 添加账号时提交二级密码\n" +
   "/cancel_add <手机号> — 取消正在添加的账号\n" +

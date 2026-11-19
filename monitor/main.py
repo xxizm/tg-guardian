@@ -1,7 +1,20 @@
 """
-TG Guardian MTProto Monitor v0.5.17
+TG Guardian MTProto Monitor v0.5.18
 Author: TG https://t.me/ziixiix
 开源版说明：代码里没有任何真实密钥，所有配置都走环境变量；WORKER_URL 的默认值是占位符，部署时改成你自己的 Worker 地址。会话文件（*.session）不在仓库里，第一次启动时自动生成。
+  777000 message with 5-6 digits counts (the handler is already restricted
+  to sender 777000). Added poll_777000: every session check also reads the
+  latest 777000 messages, so a code the event stream missed is still caught
+  within one 5-minute cycle.
+  did not trigger (e.g. the account has no 2FA, so the wrong-2FA path cannot
+  run) no longer records a bogus 24h recovery time, and the Worker no longer
+  displays it as triggered.
+  Internal keys stay digits-only (see v0.5.1).
+  main account by the raw PHONE env ("+167...") while the Worker lists
+  phones digits-only ("167..."), so ensure_clients treated the main
+  account as a second, unknown account, created a phantom unauthorized
+  client and sent a false "session invalid" alert. Fixed by normalizing
+  every phone at every boundary (env, Worker payloads, state file keys).
 - Logs in as the user's own Telegram account(s) (Telethon / MTProto).
 - MULTI-ACCOUNT (v0.5.0): one process watches several Telegram accounts
   that all belong to the same owner. Each account has its own
@@ -28,6 +41,72 @@ Author: TG https://t.me/ziixiix
     - owner taps 踢掉      -> session is revoked immediately
     - no reply in 10 min  -> session is revoked automatically
   The monitor's own session is in the trusted baseline and is never revoked.
+  real time. A half-finished login (correct code, wrong 2FA password)
+  never becomes an authorized session, so session polling cannot see it —
+  but the code message arrives the moment the code is requested, so the
+  monitor alerts immediately. The alert and the logs NEVER include the
+  code digits themselves.
+  ⛔ 拒绝 buttons. If the owner taps 拒绝, the monitor tries to freeze
+  code delivery: a separate throwaway client requests ONE code and enters
+  a deliberately wrong code 5 times against it, aiming to trigger
+  Telegram's wrong-code limit (account can't receive/send codes for ~1h;
+  recovery time is recorded as an estimate). The freeze never touches
+  the monitor's own session, and the throwaway session file is deleted
+  after. While a freeze runs, code alerts are suppressed for 15 min
+  because the freeze itself generates a code message.
+  state file, wiping "code_processed", so a denied code event was frozen
+  again on every 120 s poll. State saves now merge, and frozen event ids
+  are also kept in memory for the process lifetime.
+  and the current device snapshot to the Worker (/heartbeat), so /status
+  shows the monitor is alive and /devices shows the snapshot. 2 KV writes
+  per hour = 48/day, far under the free 1,000/day limit. Also: a code
+  request with no owner reply in 10 min is auto-frozen, same as the
+  new-device auto-revoke.
+  no VERSION constant existed (NameError), so the hourly heartbeat never
+  uploaded. The constant is defined now.
+  app/country/region/created/active/current) so the Worker can render the
+  snapshot as short readable lines instead of the raw pipe-separated
+  dump.
+  monitor's own already-authorized session (no tdata needed, no fresh
+  code requested): it calls account.GetPassword + auth.CheckPassword
+  with a deliberately wrong 2FA password 5 times. Whether Telegram
+  counts those attempts toward the login flood is NOT verified — the
+  only verified trigger is the login flow — so if the no-code path does
+  not return an explicit flood, the monitor falls back to the login-flow
+  path (fresh code entered correctly, then wrong 2FA 5 times). The
+  result alert says which path ran. The uploaded tdata bundle is NOT
+  used: it is a live login key, and the monitor already holds its own
+  authorized session that can do everything an authorized session can
+  do, so copying the tdata to the server would add risk and no
+  capability. Never upload a tdata bundle anywhere.
+  auto_code_after / auto_revoke_after (seconds) and alerts_enabled from
+  the Worker's /pending response on every poll (settings live in Worker
+  KV, changed with /set_guard and /set_revoke; env vars remain the
+  fallback defaults). Alert texts use the configured minutes instead
+  of fixed "5 分钟" / "10 分钟".
+  buttons: ✅ 同意 / 🧊 拒绝·冻结验证码 / 🔒 拒绝·冻结二级密码.
+  deny_code runs only the wrong-code freeze; deny_2fa runs only the 2FA
+  protection; a legacy "deny" (Worker <= 1.3.7, one 拒绝 button) still
+  runs both. No reply in 5 min auto-runs the 2FA protection ONLY, because
+  its block lasts until next day while the code-request block often
+  clears sooner. The /code-freeze report now carries a mode field
+  ("code" / "2fa" / "both") so the Worker can display which protection ran.
+  5 min of silence (AUTO_CODE_AFTER=300, separate from the 10 min
+  new-device auto-revoke):
+  (1) 2FA protection FIRST — a throwaway client requests ONE fresh code,
+      the monitor captures that code from its own 777000 message (in
+      memory only, never logged, never sent anywhere), enters it
+      correctly to reach the 2FA step, then enters a deliberately wrong
+      2FA password 5 times to trigger PHONE_PASSWORD_FLOOD (recovery time estimated by trigger count in 24h: 1st-3rd 1h, 4th 6h, 5th+ 24h).
+      If the code is somehow accepted without 2FA, the throwaway client
+      logs out immediately and aborts.
+  (2) Code freeze — the existing wrong-code freeze (ONE code, entered
+      wrong 5 times). It runs after the 2FA protection; if the account
+      is already flooded by step (1), its code request may be refused
+      with FloodWait — that is reported honestly, not treated as a
+      failure of the protection, because the account is already locked.
+  Either layer also locks the owner out of new-device logins for the
+  same period; already-logged-in sessions are unaffected.
 - KV writes happen only on new-device events (via the Worker), never on
   every poll, so the Cloudflare free KV write limit is not a problem.
 
@@ -77,7 +156,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("tg-guardian-mtproto")
 
-VERSION = "v0.5.17"
+VERSION = "v0.5.18"
 
 def norm_phone(p) -> str:
     """Digits-only phone. The Worker normalizes phones to digits-only,
@@ -106,7 +185,7 @@ AUTO_REVOKE_AFTER = int(os.environ.get("AUTO_REVOKE_AFTER", "600") or 600)
 AUTO_CODE_AFTER = int(os.environ.get("AUTO_CODE_AFTER", "300") or 300)
 HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", "3600") or 3600)
 STATE_FILE = os.environ.get("STATE_FILE", "devices.json")
-WORKER_URL = os.environ.get("WORKER_URL", "https://your-worker.your-subdomain.workers.dev").rstrip("/")  # 开源版占位符：改成你自己的 Worker 地址，也可以用环境变量 WORKER_URL 覆盖
+WORKER_URL = os.environ.get("WORKER_URL", "https://your-worker.your-subdomain.workers.dev").rstrip("/")  # 部署时改成你自己的 Worker 地址
 # Cloudflare's edge blocks Python's default "Python-urllib/..." User-Agent
 # on workers.dev (HTTP 403) — that broke /pending and /sync. A plain
 # custom User-Agent passes (verified: Mozilla UA -> 200, Python UA -> 403).
@@ -1746,6 +1825,50 @@ async def process_onboard(data: dict) -> None:
             log.warning("[%s] Onboard processing failed: %s", phone, exc)
 
 
+async def sync_main_phone(data: dict) -> None:
+    """Adopt a new phone number for the main (seed) account after the
+    owner changed it in Telegram and ran /change_phone (so the Worker's
+    account list now carries the new number). The session file is the
+    fixed "tg_guardian" one and stays valid (same account); only TG
+    Guardian's phone label moves, so no PHONE env-var change and no
+    manual restart are needed. Ground truth is get_me().phone, and we
+    only re-key when the new number is already in the Worker's list
+    (i.e. /change_phone has run); otherwise the stale label keeps
+    working and the owner can migrate later. Also moves the persisted
+    per-account state (session baseline, code_processed)."""
+    global PHONE
+    phones = {norm_phone(e.get("phone", "")) for e in data.get("accounts", []) or []}
+    phones.discard("")
+    if not phones or PHONE in phones:
+        return
+    acct = ACCOUNTS.get(PHONE)
+    if not acct or not acct.authorized or acct.client is None:
+        return
+    try:
+        me = await acct.client.get_me()
+    except Exception:  # noqa: BLE001
+        return
+    actual = norm_phone(getattr(me, "phone", "") or "")
+    if not actual or actual == PHONE or actual not in phones:
+        return
+    old = PHONE
+    try:
+        state = load_state()
+        accounts_state = state.get("accounts", {})
+        if isinstance(accounts_state, dict) and old in accounts_state:
+            accounts_state[actual] = accounts_state.pop(old)
+            state["accounts"] = accounts_state
+            with open(STATE_FILE, "w", encoding="utf-8") as fh:
+                json.dump(state, fh, ensure_ascii=False, indent=2)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Phone-change state migration failed: %s", exc)
+    acct.phone = actual
+    ACCOUNTS.pop(old, None)
+    ACCOUNTS[actual] = acct
+    PHONE = actual
+    log.info("[%s] Main account phone changed %s -> %s; re-keyed, session unchanged.", actual, old, actual)
+
+
 async def ensure_clients(data: dict) -> None:
     """Create clients for Worker-listed accounts we do not have yet
     (e.g. after a monitor restart, from their saved session files).
@@ -1846,6 +1969,12 @@ async def main() -> None:
     main_acct.authorized = True
     me = await client.get_me()
     log.info("TG Guardian MTProto monitor %s started as %s (id=%s).", VERSION, me.username or me.first_name, me.id)
+    # Adopt a changed main-account number (after /change_phone) before
+    # registering, so a stale PHONE env var doesn't re-add the old number.
+    try:
+        await sync_main_phone(fetch_pending())
+    except Exception:  # noqa: BLE001
+        pass
     register_account(PHONE, "主账号")
     bot_id = fetch_bot_id()
     if bot_id:
@@ -1868,6 +1997,7 @@ async def main() -> None:
             while DIRECT_QUEUE:
                 kind, phone, ident = DIRECT_QUEUE.pop(0)
                 await execute_directive(kind, phone, ident, data)
+            await sync_main_phone(data)
             await ensure_clients(data)
             await process_onboard(data)
             await cleanup_accounts(data)
