@@ -1,5 +1,5 @@
 /**
- * TG Guardian Worker v1.4.18
+ * TG Guardian Worker v1.4.19
  * Cloudflare Worker + KV (TG_GUARD_DATA) + Telegram Bot API.
  * Env: BOT_TOKEN, OWNER_ID, WEBHOOK_SECRET, KV binding TG_GUARD_DATA.
  * Author: TG https://t.me/ziixiix
@@ -160,9 +160,15 @@
  * the panel stops lying; with a stored record the real wait overwrites
  * the estimate. A failed/inconclusive probe changes nothing. An old
  * monitor (no flood_active field) keeps the previous behaviour.
+ *
+ * VIEW COMMANDS SHOW ALL ACCOUNTS (v1.4.19): /status, /devices, /logs and
+ * /security_check no longer ask which account when several are registered
+ * and no account is given - they show every account at once, like before
+ * v1.4.15. Pass an account (phone or name) to see just that one.
+ * /login_guard and /flood_status still ask when no account is given.
  */
 
-const VERSION = "1.4.18";
+const VERSION = "1.4.19";
 
 // Wake-up marker (v1.4.9): sent as a short bot message after any decision
 // button tap so the monitor polls /pending immediately instead of waiting
@@ -262,6 +268,18 @@ async function resolveAccountArg(env, args) {
   }
   const found = findAccount(accounts, args[0]) || findAccount(accounts, args.join(" "));
   if (found) return { account: found, accounts };
+  return { error: `没找到账号「${args.join(" ")}」，发 /accounts 看看已有的账号。`, accounts };
+}
+
+// View commands (/status, /devices, /logs, /security_check): with no account
+// argument show ALL accounts; with an argument show just that one.
+// (v1.4.15 made them ask which account; too many taps — reverted for views.)
+async function resolveViewTargets(env, args) {
+  const accounts = await getAccounts(env);
+  if (!accounts.length) return { none: true, accounts };
+  if (!args || !args.length) return { targets: accounts, accounts };
+  const found = findAccount(accounts, args[0]) || findAccount(accounts, args.join(" "));
+  if (found) return { targets: [found], accounts };
   return { error: `没找到账号「${args.join(" ")}」，发 /accounts 看看已有的账号。`, accounts };
 }
 
@@ -1045,11 +1063,10 @@ async function runCommand(env, chatId, fromId, rawText) {
 // --- Status commands: optional account arg; without one they show
 // the single registered account directly, or ask which account when several are registered. ---
 if (cmd === "/security" || cmd === "/status" || cmd === "/check") {
-const res = await resolveAccountArg(env, args);
+const res = await resolveViewTargets(env, args);
 if (res.none) return sendMessage(env, chatId, "👥 还没有账号。发 /add_account <手机号> [名字] 添加第一个账号。", true);
 if (res.error) return sendMessage(env, chatId, res.error, true);
-if (res.needChoice) return sendMessage(env, chatId, choiceText(res.accounts) + `\n用法：${cmd} <手机号或名字>`, true);
-const targets = res.account? [res.account]: res.accounts;
+const targets = res.targets;
 let out = "🛡️ TG Guardian " + (cmd === "/status"? "整体状态": "安全状态") + "\n\n" +
 "管理机器人：在线 ✅\n" +
 "Webhook：已连接 ✅\n" +
@@ -1074,11 +1091,10 @@ out += `\n新设备登录时先发告警，${s.revokeSec} 秒内没回复自动�
 return sendMessage(env, chatId, out, true);
 }
 if (cmd === "/devices" || cmd === "/sessions" || cmd === "/list") {
-const res = await resolveAccountArg(env, args);
+const res = await resolveViewTargets(env, args);
 if (res.none) return sendMessage(env, chatId, "👥 还没有账号。发 /add_account <手机号> [名字] 添加第一个账号。", true);
 if (res.error) return sendMessage(env, chatId, res.error, true);
-if (res.needChoice) return sendMessage(env, chatId, choiceText(res.accounts) + `\n用法：${cmd} <手机号或名字>`, true);
-const targets = res.account? [res.account]: res.accounts;
+const targets = res.targets;
 let out = "";
 for (const acct of targets) {
 const s = await accountSummary(env, acct);
@@ -1105,11 +1121,10 @@ out += "MTProto 监控端还没有把设备快照同步到 KV。\n" +
 return sendMessage(env, chatId, out.trim(), true);
 }
 if (cmd === "/logs" || cmd === "/alerts") {
-const res = await resolveAccountArg(env, args);
+const res = await resolveViewTargets(env, args);
 if (res.none) return sendMessage(env, chatId, "👥 还没有账号。发 /add_account <手机号> [名字] 添加第一个账号。", true);
 if (res.error) return sendMessage(env, chatId, res.error, true);
-if (res.needChoice) return sendMessage(env, chatId, choiceText(res.accounts) + `\n用法：${cmd} <手机号或名字>`, true);
-const targets = res.account? [res.account]: res.accounts;
+const targets = res.targets;
 let out = "";
 for (const acct of targets) {
 const logs = await kvGetAcct(env, acct.phone, "alerts");
@@ -1243,11 +1258,10 @@ else out += "\n恢复时间按 24 小时内触发次数估算（前 3 次 1 小�
 return sendMessage(env, chatId, out, true);
 }
 if (cmd === "/security_check") {
-const res = await resolveAccountArg(env, args);
+const res = await resolveViewTargets(env, args);
 if (res.none) return sendMessage(env, chatId, "👥 还没有账号。发 /add_account <手机号> [名字] 添加第一个账号。", true);
 if (res.error) return sendMessage(env, chatId, res.error, true);
-if (res.needChoice) return sendMessage(env, chatId, choiceText(res.accounts) + `\n用法：${cmd} <手机号或名字>`, true);
-const targets = res.account? [res.account]: res.accounts;
+const targets = res.targets;
 const wh = await getWebhookInfo(env);
 const whLine = wh
 ? (wh.url && wh.url.includes("tg-guardian")? `✅ 已指向 ${wh.url}`: `⚠️ Webhook 地址异常：${wh.url || "空"}`)
