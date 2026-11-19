@@ -60,7 +60,7 @@ Telegram 登录分两步：先请求验证码（发到你的 Telegram 应用内�
 
 ### 3. 申请 Telegram API ID / Hash
 
-1. 打开 https://my.telegram.org，用你的 Telegram 账号登录。
+1. 打开 https://my.telegram.org ，用你的 Telegram 账号登录。
 2. 点 **API development tools**，填一个应用名（随便填，比如 `tg-guardian`），平台选 Desktop，其他留空，点创建。
 3. 记下 **API_ID**（数字）和 **API_HASH**（字符串）。这两个只标识“你的应用”，不标识账号，多个账号共用同一份。
 
