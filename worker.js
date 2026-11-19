@@ -1,5 +1,5 @@
 /**
- * TG Guardian Worker v1.4.19
+ * TG Guardian Worker v1.4.20
  * Cloudflare Worker + KV (TG_GUARD_DATA) + Telegram Bot API.
  * Env: BOT_TOKEN, OWNER_ID, WEBHOOK_SECRET, KV binding TG_GUARD_DATA.
  * Author: TG https://t.me/ziixiix
@@ -166,9 +166,16 @@
  * and no account is given - they show every account at once, like before
  * v1.4.15. Pass an account (phone or name) to see just that one.
  * /login_guard and /flood_status still ask when no account is given.
+ *
+ * CHANGE PHONE (v1.4.20): /change_phone <old> <new> migrates an account's
+ * phone-keyed KV records after the owner changes the Telegram account's
+ * phone number (same account, same user id; the monitor session stays
+ * valid). The monitor's PHONE env var must be updated to the new number
+ * too, then the monitor restarted, so its session mapping still resolves
+ * to the existing session file.
  */
 
-const VERSION = "1.4.19";
+const VERSION = "1.4.20";
 
 // Wake-up marker (v1.4.9): sent as a short bot message after any decision
 // button tap so the monitor polls /pending immediately instead of waiting
@@ -658,6 +665,35 @@ async function deleteAccountData(env, phone) {
   for (const key of ["pending_index", "code_index", "code_frozen", "alerts", "sessions", "mtproto_heartbeat", "settings"]) {
     await kvDeleteAcct(env, phone, key);
   }
+}
+
+async function migrateAccountData(env, oldPhone, newPhone) {
+  // Copy every per-account KV record from oldPhone to newPhone, then
+  // delete the old copies. Used by /change_phone after the owner changes
+  // the Telegram account's phone number (same account, same user id, so
+  // the monitor session stays valid; only TG Guardian's phone-keyed
+  // records move). Values are copied as-is: the phone lives in the key
+  // prefix, not inside the stored JSON.
+  const fixed = ["pending_index", "code_index", "code_frozen", "alerts", "sessions", "mtproto_heartbeat", "settings", "flood_probe", "flood_triggers", "sustain"];
+  let moved = 0;
+  const pending = await getPendingList(env, oldPhone);
+  for (const p of pending) {
+    const raw = await kvGetAcct(env, oldPhone, "pending:" + p.hash);
+    if (raw !== null && raw !== undefined) { await kvPutAcct(env, newPhone, "pending:" + p.hash, raw); moved++; }
+  }
+  const codes = await getCodeEvents(env, oldPhone);
+  for (const c of codes) {
+    const raw = await kvGetAcct(env, oldPhone, "code:" + c.id);
+    if (raw !== null && raw !== undefined) { await kvPutAcct(env, newPhone, "code:" + c.id, raw); moved++; }
+  }
+  for (const key of fixed) {
+    const raw = await kvGetAcct(env, oldPhone, key);
+    if (raw !== null && raw !== undefined) { await kvPutAcct(env, newPhone, key, raw); moved++; }
+  }
+  for (const p of pending) await kvDeleteAcct(env, oldPhone, "pending:" + p.hash);
+  for (const c of codes) await kvDeleteAcct(env, oldPhone, "code:" + c.id);
+  for (const key of fixed) await kvDeleteAcct(env, oldPhone, key);
+  return moved;
 }
 
 // --- Per-account status pieces, shared by /status, /login_guard,
@@ -1197,6 +1233,34 @@ if (cmd === "/rename_account") {
   target.name = newName;
   await saveAccounts(env, list);
   return sendMessage(env, chatId, `✅ 已改名：【${oldLabel}】→【${newName}（尾号 ${target.phone.slice(-4)}）】`, true);
+}
+
+if (cmd === "/change_phone") {
+  // /change_phone <old phone> <new phone>: the owner changed the Telegram
+  // account's phone number (same account, same user id). Move TG
+  // Guardian's phone-keyed records to the new number. The monitor session
+  // stays valid; the monitor's PHONE env var must be updated to the new
+  // number too, then the monitor restarted.
+  const oldPhone = normalizePhone(args[0]);
+  const newPhone = normalizePhone(args[1]);
+  if (!oldPhone || !newPhone) {
+    return sendMessage(env, chatId, "用法：/change_phone <旧手机号> <新手机号>\n你在 Telegram 里换了号码之后，把 TG Guardian 里这个账号的记录从旧号码迁到新号码。", true);
+  }
+  if (oldPhone === newPhone) {
+    return sendMessage(env, chatId, "旧号码和新号码一样，不用改。", true);
+  }
+  const accounts = await getAccounts(env);
+  const acct = accounts.find((a) => a.phone === oldPhone);
+  if (!acct) {
+    return sendMessage(env, chatId, `没找到账号 ${displayPhone(oldPhone)}，发 /accounts 看看已有的账号。`, true);
+  }
+  if (accounts.find((a) => a.phone === newPhone)) {
+    return sendMessage(env, chatId, `新号码 ${displayPhone(newPhone)} 已经是一个已注册账号了，不能迁过去。`, true);
+  }
+  const moved = await migrateAccountData(env, oldPhone, newPhone);
+  acct.phone = newPhone;
+  await saveAccounts(env, accounts);
+  return sendMessage(env, chatId, `✅ 已把账号【${accountLabel(acct)}】的记录从 ${displayPhone(oldPhone)} 迁到 ${displayPhone(newPhone)}（共 ${moved} 条）。`, true);
 }
 if (cmd === "/login_guard") {
 const res = await resolveAccountArg(env, args);
