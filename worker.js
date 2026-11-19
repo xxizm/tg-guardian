@@ -426,7 +426,7 @@ const HELP_TEXT =
   "/alert_off — 关闭安全异常告警\n" +
   "/clear_alerts — 手动清空最近告警\n" +
 "/clear_flood — 手动清除已记录的 Flood 状态\n" +
-"/check_flood — 手动检查 Flood 是否已恢复（会发一次验证码来实测，收到后忽略即可）\n\n" +
+"/check_flood — 手动检查 Flood 是否已恢复（可能会收到一次验证码，忽略即可）\n\n" +
   "⏱️ 时间设置（60–3600 秒，改完 2 分钟内生效）\n" +
   "/set_guard <秒> [账号] — 验证码无人确认后自动冻结二级密码的时间\n" +
   "/set_revoke <秒> [账号] — 新设备无人确认后自动注销的时间\n\n" +
@@ -1311,7 +1311,7 @@ if (res.needChoice) return sendMessage(env, chatId, choiceText(res.accounts) + `
 const existing = await kvGetAcct(env, res.account.phone, "flood_probe");
 if (existing) return sendMessage(env, chatId, `🔍 账号【${accountLabel(res.account)}】已经在检查了，稍等，结果会通知你。`, true);
 await kvPutAcct(env, res.account.phone, "flood_probe", JSON.stringify({ requested_at: new Date().toISOString() }));
-return sendMessage(env, chatId, `🔍 已安排检查账号【${accountLabel(res.account)}】的 Flood 状态，监控端 2 分钟内开始探测，结果会通知你。\n\n检查时会请求一个验证码，收到后忽略即可。`, true);
+return sendMessage(env, chatId, `🔍 已安排检查账号【${accountLabel(res.account)}】的 Flood 状态，监控端 2 分钟内开始探测，结果会通知你。\n\n可能会收到一次验证码，忽略即可。`, true);
 }
 if (cmd === "/set_guard" || cmd === "/set_revoke") {
 // Accept seconds and account in either order: /set_guard 300,

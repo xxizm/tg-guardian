@@ -156,7 +156,7 @@ Telegram 登录分两步：先请求验证码（发到你的 Telegram 应用内�
 | `/alert_on [账号]` / `/alert_off [账号]` | 开 / 关提醒弹窗（只关弹窗，保护照常运行） |
 | `/clear_alerts [账号]` | 清空提醒记录 |
 | `/clear_flood [账号]` | 手动清除一条 Flood 记录 |
-| `/check_flood [账号]` | 手动探测 Flood 是不是已经解除了（会发一次验证码来实测，收到后忽略即可） |
+| `/check_flood [账号]` | 手动探测 Flood 是不是已经解除了（可能会收到一次验证码，忽略即可） |
 | `/sustain_flood_on [分钟] [账号]` | 开启持续 Flood 保护（默认 30 分钟，最长 1440 分钟） |
 | `/sustain_flood_off [账号]` | 关闭持续 Flood 保护 |
 | `/help` | 帮助 |
