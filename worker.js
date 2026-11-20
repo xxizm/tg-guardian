@@ -1,5 +1,5 @@
 /**
- * TG Guardian Worker v1.4.26
+ * TG Guardian Worker v1.4.27
  * Cloudflare Worker + KV (TG_GUARD_DATA) + Telegram Bot API.
  * Env: BOT_TOKEN, OWNER_ID, WEBHOOK_SECRET, KV binding TG_GUARD_DATA.
  * Author: TG https://t.me/ziixiix
@@ -219,9 +219,15 @@
  * New /stop_qr [account] stops an in-progress QR login from text,
  * the same as the stop button under each QR photo (deletes the
  * onboard record and wakes the monitor).
+ *
+ * MENU REFRESH (v1.4.27): ensureMenu now clears any stale command
+ * lists under the all_private_chats and owner-chat scopes before
+ * re-setting the default [start, help] list, and sets the chat menu
+ * button to "commands" so clients show it by the input field. It
+ * runs on /start AND /help; failures are logged, never thrown.
  */
 
-const VERSION = "1.4.26";
+const VERSION = "1.4.27";
 
 // Wake-up marker (v1.4.9): sent as a short bot message after any decision
 // button tap so the monitor polls /pending immediately instead of waiting
@@ -548,7 +554,7 @@ const KEYBOARD = {
 };
 
 // Bottom-left command menu (Telegram setMyCommands). Stored server-side by
-// Telegram, so it survives clearing the chat history. Set once per /start.
+// Telegram, so it survives clearing the chat history. Set on /start and /help.
 // v1.4.26: only /start and /help are listed here; every other command
 // still works when typed and is documented in /help (HELP_TEXT).
 const BOT_COMMANDS = [
@@ -557,13 +563,29 @@ const BOT_COMMANDS = [
 ];
 
 async function ensureMenu(env) {
-  try {
-    await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/setMyCommands`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ commands: BOT_COMMANDS }),
-    });
-  } catch { /* menu is best-effort; typing the commands still works */ }
+  // Best-effort: typing the commands still works if this fails. Each call
+  // is independent so one failure does not block the rest. Stale command
+  // lists under narrower scopes shadow the default list in clients, so
+  // clear those first, then set the default list and the menu button.
+  const calls = [
+    ["deleteMyCommands", { scope: { type: "all_private_chats" } }],
+    ["deleteMyCommands", { scope: { type: "chat", chat_id: Number(env.OWNER_ID) } }],
+    ["setMyCommands", { commands: BOT_COMMANDS }],
+    ["setChatMenuButton", { menu_button: { type: "commands" } }],
+  ];
+  for (const [method, payload] of calls) {
+    try {
+      const res = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json().catch(() => null);
+      if (!data || !data.ok) console.log("ensureMenu " + method + " failed:", JSON.stringify(data));
+    } catch (e) {
+      console.log("ensureMenu " + method + " error:", e);
+    }
+  }
 }
 
 async function sendMessage(env, chatId, text, withKeyboard, customKeyboard) {
@@ -985,6 +1007,7 @@ async function runCommand(env, chatId, fromId, rawText, ctx) {
     return sendMessage(env, chatId, "✅ TG Guardian 已启动，监控正在运行。\n\n" + HELP_TEXT, true);
   }
   if (cmd === "/help") {
+    await ensureMenu(env);
     return sendMessage(env, chatId, HELP_TEXT, true);
   }
   if (cmd === "/ping") {
