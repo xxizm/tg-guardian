@@ -1,5 +1,5 @@
 /**
- * TG Guardian Worker v1.4.23
+ * TG Guardian Worker v1.4.24
  * Cloudflare Worker + KV (TG_GUARD_DATA) + Telegram Bot API.
  * Env: BOT_TOKEN, OWNER_ID, WEBHOOK_SECRET, KV binding TG_GUARD_DATA.
  * Author: TG https://t.me/ziixiix
@@ -188,9 +188,19 @@
  * stateless monitor container restores its sessions after a restart
  * instead of dying with the ephemeral disk. Deleted on
  * /remove_account, moved on /change_phone.
+ *
+ * PAUSE PROTECTION (v1.4.24): /pause_guard [account] [minutes]
+ * pauses protection - no account = all accounts, no minutes = until
+ * manually resumed; /resume_guard [account] resumes. Stored as
+ * pause_until in acct:<phone>:settings (ms epoch; -1 = indefinite;
+ * 0/absent = not paused) and returned in GET /pending like the other
+ * settings. While paused the monitor skips auto-revoke, auto-freeze
+ * and sustain triggers; alerts still go out and manual button taps
+ * still work. (/alert_off only silences popups; this stops the
+ * automatic actions themselves.)
  */
 
-const VERSION = "1.4.23";
+const VERSION = "1.4.24";
 
 // Wake-up marker (v1.4.9): sent as a short bot message after any decision
 // button tap so the monitor polls /pending immediately instead of waiting
@@ -202,7 +212,7 @@ const WAKEUP_TEXT = "⚡ TG Guardian：正在唤醒监控端…";
 // changed with bot commands (/set_guard, /set_revoke, /alert_on,
 // /alert_off). The monitor reads them from GET /pending on every poll,
 // so a change takes effect within two minutes.
-const DEFAULT_SETTINGS = { auto_code_after: 300, auto_revoke_after: 600, alerts_enabled: true };
+const DEFAULT_SETTINGS = { auto_code_after: 300, auto_revoke_after: 600, alerts_enabled: true, pause_until: 0 };
 
 async function getSettings(env, phone) {
   try {
@@ -215,12 +225,31 @@ async function getSettings(env, phone) {
       if (Number.isFinite(v) && v >= 60 && v <= 3600) out[k] = Math.round(v);
     }
     if (typeof s.alerts_enabled === "boolean") out.alerts_enabled = s.alerts_enabled;
+    const pu = Number(s.pause_until);
+    if (Number.isFinite(pu) && (pu === -1 || pu >= 0)) out.pause_until = Math.round(pu);
     return out;
   } catch { return { ...DEFAULT_SETTINGS }; }
 }
 
 async function saveSettings(env, phone, settings) {
   return kvPutAcct(env, phone, "settings", JSON.stringify(settings));
+}
+
+// Pause (v1.4.24): pause_until in settings - ms epoch; -1 = paused
+// until manually resumed; 0/absent = not paused. While paused the
+// monitor skips auto-revoke / auto-freeze / sustain; alerts and manual
+// button decisions still work. /alert_off only silences popups - this
+// is the one that actually stops the automatic actions.
+function isPaused(settings) {
+  const pu = settings && settings.pause_until;
+  return pu === -1 || (typeof pu === "number" && pu > Date.now());
+}
+
+function pauseLine(settings) {
+  if (!isPaused(settings)) return "";
+  return settings.pause_until === -1
+    ? "⏸ 已暂停保护（手动恢复前不自动处理）"
+    : `⏸ 已暂停保护，${fmtTime(new Date(settings.pause_until).toISOString())} 自动恢复`;
 }
 
 // --- Accounts: [{phone, name}]. phone is digits only. The list is the
@@ -466,6 +495,8 @@ const HELP_TEXT =
   "/security_check — 检查防护系统配置\n" +
   "/alert_on — 开启安全异常告警\n" +
   "/alert_off — 关闭安全异常告警\n" +
+  "/pause_guard [账号] [分钟] — 暂停保护（不填=所有账号一直暂停；填分钟=到点自动恢复）\n" +
+  "/resume_guard [账号] — 恢复保护\n" +
   "/clear_alerts — 手动清空最近告警\n" +
 "/clear_flood — 手动清除已记录的 Flood 状态\n" +
 "/check_flood — 手动检查 Flood 是否已恢复（可能会收到一次验证码，忽略即可）\n\n" +
@@ -514,6 +545,8 @@ const BOT_COMMANDS = [
   { command: "security_check", description: "检查防护系统配置" },
   { command: "alert_on", description: "开启安全异常告警" },
   { command: "alert_off", description: "关闭安全异常告警" },
+  { command: "pause_guard", description: "暂停保护（可加账号和分钟）" },
+  { command: "resume_guard", description: "恢复保护" },
   { command: "clear_alerts", description: "手动清空最近告警" },
   { command: "clear_flood", description: "手动清除 Flood 记录" },
   { command: "check_flood", description: "手动检查 Flood 是否恢复" },
@@ -987,7 +1020,8 @@ async function runCommand(env, chatId, fromId, rawText) {
       out += `${accountLabel(acct)} — ${displayPhone(acct.phone)}\n` +
         `  设备：${s.sessionCount !== null ? s.sessionCount + " 个" : "未知"} · ${hbLine}\n` +
         `  待确认：新设备 ${s.open.length} 个，验证码请求 ${s.openCode.length} 个\n` +
-        `  Flood：${frozenLine(s.frozen, s.sustainLoop)}\n\n`;
+        `  Flood：${frozenLine(s.frozen, s.sustainLoop)}\n` +
+        (pauseLine(s.settings) ? `  保护：${pauseLine(s.settings)}\n` : "") + `\n`;
     }
     if (onboard.length) {
       out += "⏳ 正在添加：\n";
@@ -1137,7 +1171,8 @@ out += `\n【${accountLabel(acct)}】\n` +
 `待确认的新设备：${s.open.length? s.open.length + ` 个，${s.revokeSec} 秒内没回复会自动注销`: "无"}\n` +
 `待确认的验证码请求：${s.openCode.length? s.openCode.length + ` 个，${s.guardSec} 秒内没回复会自动冻结二级密码`: "无"}\n` +
 `登录功能：${frozenLine(s.frozen, s.sustainLoop)}\n` +
-`异常告警：${s.settings.alerts_enabled? "开 ✅": "关（只自动处理，不弹窗）"}\n`;
+`异常告警：${s.settings.alerts_enabled? "开 ✅": "关（只自动处理，不弹窗）"}\n` +
+(pauseLine(s.settings)? `保护状态：${pauseLine(s.settings)}\n`: "");
 }
 if (targets.length === 1) {
 const s = await accountSummary(env, targets[0]);
@@ -1294,6 +1329,7 @@ out += `\n【${accountLabel(acct)}】\n` +
 `验证码自动保护：${s.guardSec} 秒无回复 → 自动冻结二级密码\n` +
 `新设备自动注销：${s.revokeSec} 秒无回复 → 自动注销\n` +
 `异常告警：${s.settings.alerts_enabled? "开 ✅": "关（只自动处理，不弹窗）"}\n` +
+(pauseLine(s.settings)? `保护状态：${pauseLine(s.settings)}\n`: "") +
 `待确认的新设备：${s.open.length? s.open.length + " 个": "无"}\n` +
 `待确认的验证码请求：${s.openCode.length? s.openCode.length + " 个": "无"}\n` +
 `Flood 状态：${frozenLine(s.frozen, s.sustainLoop)}\n` +
@@ -1364,7 +1400,8 @@ out += `\n【${accountLabel(acct)}】\n` +
 `设备快照：${s.sessionCount!== null? s.sessionCount + " 个已确认设备": "未知（快照在服务器本地）"}\n` +
 `待确认：新设备 ${s.open.length} 个，验证码请求 ${s.openCode.length} 个\n` +
 `Flood 记录：${s.frozen? "有（/flood_status 看详情）": "无"}\n` +
-`异常告警：${s.settings.alerts_enabled? "开 ✅": "关"}\n`;
+`异常告警：${s.settings.alerts_enabled? "开 ✅": "关"}\n` +
+(pauseLine(s.settings)? `保护状态：${pauseLine(s.settings)}\n`: "");
 }
 out += "\n这是防护系统自己的检查。账号本身的二级密码、恢复邮箱机器人看不到，请在 Telegram 设置 → 隐私 → 两步验证里自己确认。";
 return sendMessage(env, chatId, out, true);
@@ -1382,6 +1419,56 @@ return sendMessage(env, chatId,
 settings.alerts_enabled
 ? `✅ 账号【${accountLabel(res.account)}】告警已开启。`
 : `🔕 账号【${accountLabel(res.account)}】告警已关闭：不再弹窗，超时仍会自动处理，结果仍会通知你。\n\n想重新开启：/alert_on ${displayPhone(res.account.phone)}`, true);
+}
+if (cmd === "/pause_guard") {
+const accounts = await getAccounts(env);
+if (!accounts.length) return sendMessage(env, chatId, "👥 还没有账号。发 /add_account <手机号> [名字] 添加第一个账号。", true);
+const usage = "用法：/pause_guard [账号] [分钟]\n例如：/pause_guard（所有账号一直暂停）\n/pause_guard 60（所有账号暂停 60 分钟）\n/pause_guard +8613800138000 60（只暂停这个账号 60 分钟）";
+let targets = accounts;
+let minutes = null;
+if (args.length === 1) {
+const found = findAccount(accounts, args[0]);
+if (found) targets = [found];
+else if (/^\d+$/.test(args[0])) minutes = parseInt(args[0], 10);
+else return sendMessage(env, chatId, `没找到账号「${args[0]}」，发 /accounts 看看已有的账号。`, true);
+} else if (args.length === 2) {
+const found = findAccount(accounts, args[0]);
+if (!found) return sendMessage(env, chatId, `没找到账号「${args[0]}」，发 /accounts 看看已有的账号。`, true);
+targets = [found];
+if (!/^\d+$/.test(args[1])) return sendMessage(env, chatId, usage, true);
+minutes = parseInt(args[1], 10);
+} else if (args.length > 2) {
+return sendMessage(env, chatId, usage, true);
+}
+if (minutes !== null && (minutes < 1 || minutes > 10080)) {
+return sendMessage(env, chatId, "分钟数要在 1–10080 之间（最长 7 天）。不填分钟就是一直暂停，手动 /resume_guard 恢复。", true);
+}
+const pauseUntil = minutes === null ? -1 : Date.now() + minutes * 60000;
+for (const acct of targets) {
+const settings = await getSettings(env, acct.phone);
+settings.pause_until = pauseUntil;
+await saveSettings(env, acct.phone, settings);
+}
+const who = targets.length === 1 ? `账号【${accountLabel(targets[0])}】` : "所有账号";
+const when = minutes === null ? "手动恢复前不自动处理" : `${minutes} 分钟（${fmtTime(new Date(pauseUntil).toISOString())} 自动恢复）`;
+return sendMessage(env, chatId, `⏸ 已暂停${who}的保护：${when}。\n暂停期间不再自动注销/冻结，告警照常发，按钮手动点照常生效。\n恢复：/resume_guard${targets.length === 1 ? " " + displayPhone(targets[0].phone) : ""}`, true);
+}
+if (cmd === "/resume_guard") {
+const accounts = await getAccounts(env);
+if (!accounts.length) return sendMessage(env, chatId, "👥 还没有账号。发 /add_account <手机号> [名字] 添加第一个账号。", true);
+let targets = accounts;
+if (args.length) {
+const found = findAccount(accounts, args[0]) || findAccount(accounts, args.join(" "));
+if (!found) return sendMessage(env, chatId, `没找到账号「${args.join(" ")}」，发 /accounts 看看已有的账号。`, true);
+targets = [found];
+}
+for (const acct of targets) {
+const settings = await getSettings(env, acct.phone);
+settings.pause_until = 0;
+await saveSettings(env, acct.phone, settings);
+}
+const who = targets.length === 1 ? `账号【${accountLabel(targets[0])}】` : "所有账号";
+return sendMessage(env, chatId, `▶️ 已恢复${who}的保护。`, true);
 }
 if (cmd === "/clear_alerts" || cmd === "/clear_logs") {
 const res = await resolveAccountArg(env, args);

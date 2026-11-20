@@ -1,5 +1,5 @@
 """
-TG Guardian MTProto Monitor v0.5.23
+TG Guardian MTProto Monitor v0.5.24
 Author: TG https://t.me/ziixiix
 - Logs in as the user's own Telegram account(s) (Telethon / MTProto).
 - MULTI-ACCOUNT (v0.5.0): one process watches several Telegram accounts
@@ -117,7 +117,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("tg-guardian-mtproto")
 
-VERSION = "v0.5.23"
+VERSION = "v0.5.24"
 
 def norm_phone(p) -> str:
     """Digits-only phone. The Worker normalizes phones to digits-only,
@@ -233,6 +233,9 @@ class Acct:
         # rescheduled the timer (loop / count mode), so it may fire
         # again for the new round.
         self.sustain_trigger_at = None
+        # Pause (v0.5.24): whether protection was paused on the last
+        # poll, so a timed pause expiring can be announced once.
+        self.was_paused = False
 
     @property
     def label(self) -> str:
@@ -1207,7 +1210,8 @@ async def run_protection(acct: Acct, event_id: str, mode: str) -> dict:
 def settings_from(per: dict) -> dict:
     """Worker settings for one account, with env defaults.
 
-    The Worker stores auto times (seconds) and the alerts switch in KV;
+    The Worker stores auto times (seconds), the alerts switch and the
+    pause deadline in KV;
     the monitor picks them up on every /pending poll (<= 120 s), so a
     /set_guard or /set_revoke command takes effect within two minutes.
     A missing or invalid value falls back to the env default.
@@ -1223,11 +1227,26 @@ def settings_from(per: dict) -> dict:
             return fallback
         return v if 60 <= v <= 3600 else fallback
 
+    def _pause_until():
+        try:
+            v = int(raw.get("pause_until", 0))
+        except (TypeError, ValueError):
+            return 0
+        return v if v == -1 or v >= 0 else 0
+
     return {
         "auto_code_after": _seconds("auto_code_after", AUTO_CODE_AFTER),
         "auto_revoke_after": _seconds("auto_revoke_after", AUTO_REVOKE_AFTER),
         "alerts_enabled": raw.get("alerts_enabled", True) is not False,
+        "pause_until": _pause_until(),
     }
+
+
+def _is_paused(settings: dict) -> bool:
+    """pause_until: -1 = paused until manually resumed; a ms-epoch
+    timestamp = paused until then; 0/absent = not paused."""
+    pu = settings.get("pause_until", 0)
+    return pu == -1 or (isinstance(pu, int) and pu > int(time.time() * 1000))
 
 
 def _sgt_short(iso: str) -> str:
@@ -1332,6 +1351,7 @@ async def process_code_events(acct: Acct, data: dict) -> None:
         return
     settings = settings_from(per)
     auto_code_after = settings["auto_code_after"]
+    paused = _is_paused(settings)
     state = load_account_state(acct.phone)
     processed = set(state.get("code_processed", [])) | acct.freeze_done
     now = time.time()
@@ -1352,7 +1372,7 @@ async def process_code_events(acct: Acct, data: dict) -> None:
                 elapsed = now - detected.timestamp()
             except ValueError:
                 elapsed = 0
-            if elapsed >= auto_code_after:
+            if not paused and elapsed >= auto_code_after:
                 mode = "2fa"
                 auto = True
                 log.warning("[%s] Code request %s unanswered for %d s; auto-freezing 2FA.",
@@ -1518,9 +1538,28 @@ async def process_sustain(acct: Acct, data: dict) -> None:
     except ValueError:
         log.warning("[%s] Sustained Flood record has a bad trigger_at: %s", acct.phone, sustain)
         return
+    if _is_paused(settings_from(per)):
+        return
     if datetime.now(timezone.utc) >= trigger_at:
         acct.sustain_fired = True
         await run_scheduled_flood(acct)
+
+
+async def check_pause_expiry(acct: Acct, data: dict) -> None:
+    """Announce once when a timed pause expires (v0.5.24).
+
+    pause_until is a ms-epoch timestamp for a timed pause, -1 for an
+    indefinite one and 0 after a manual /resume_guard. Only the timed
+    case needs an announcement here - a manual resume is already
+    confirmed by the Worker reply, and an indefinite pause never
+    expires on its own."""
+    per = per_account(data, acct.phone)
+    settings = settings_from(per)
+    pu = settings.get("pause_until", 0)
+    paused_now = _is_paused(settings)
+    if acct.was_paused and not paused_now and isinstance(pu, int) and pu > 0:
+        send_bot_alert("▶️ TG Guardian：暂停时间到，保护已恢复。", acct)
+    acct.was_paused = paused_now
 
 
 async def process_flood_probe(acct: Acct, data: dict) -> None:
@@ -1660,14 +1699,16 @@ async def process_pending(acct: Acct, data: dict) -> None:
         return
     per = per_account(data, acct.phone)
     decisions = {str(p.get("hash")): p.get("status") for p in per.get("pending", [])}
-    auto_revoke_after = settings_from(per)["auto_revoke_after"]
+    settings = settings_from(per)
+    auto_revoke_after = settings["auto_revoke_after"]
+    paused = _is_paused(settings)
     now = time.time()
     for h in list(pending):
         status = decisions.get(h, "pending")
         elapsed = now - float(pending[h].get("detected_at", now))
         if status == "allow":
             await apply_device_decision(acct, h, "allow", False, auto_revoke_after)
-        elif status == "revoke" or (status == "pending" and elapsed >= auto_revoke_after):
+        elif status == "revoke" or (status == "pending" and not paused and elapsed >= auto_revoke_after):
             await apply_device_decision(acct, h, "revoke", status == "pending", auto_revoke_after)
 
 
@@ -2065,6 +2106,7 @@ async def main() -> None:
                     await process_code_events(acct, data)
                     await process_flood_probe(acct, data)
                     await process_sustain(acct, data)
+                    await check_pause_expiry(acct, data)
                     acct.last_ok = time.time()
                 except Exception as exc:  # noqa: BLE001 - one account's failure must not stop the others
                     log.warning("[%s] Monitor cycle failed, will retry: %s", phone, exc)
