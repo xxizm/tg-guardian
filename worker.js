@@ -1129,7 +1129,7 @@ out += `\n【${accountLabel(acct)}】\n` +
 `设备快照：${s.sessionCount!== null? s.sessionCount + " 个已确认设备": "（快照在服务器本地）"}\n` +
 `待确认的新设备：${s.open.length? s.open.length + ` 个，${s.revokeSec} 秒内没回复会自动注销`: "无"}\n` +
 `待确认的验证码请求：${s.openCode.length? s.openCode.length + ` 个，${s.guardSec} 秒内没回复会自动冻结二级密码`: "无"}\n` +
-`验证码功能：${frozenLine(s.frozen, s.sustainLoop)}\n` +
+`登录功能：${frozenLine(s.frozen, s.sustainLoop)}\n` +
 `异常告警：${s.settings.alerts_enabled? "开 ✅": "关（只自动处理，不弹窗）"}\n`;
 }
 if (targets.length === 1) {
