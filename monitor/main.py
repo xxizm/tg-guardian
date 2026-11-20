@@ -1,5 +1,5 @@
 """
-TG Guardian MTProto Monitor v0.5.21
+TG Guardian MTProto Monitor v0.5.22
 Author: TG https://t.me/ziixiix
 - Logs in as the user's own Telegram account(s) (Telethon / MTProto).
 - MULTI-ACCOUNT (v0.5.0): one process watches several Telegram accounts
@@ -52,6 +52,14 @@ Author: TG https://t.me/ziixiix
   Settings (auto_code_after / auto_revoke_after in seconds,
   alerts_enabled) are read from the Worker's /pending response on every
   poll; env vars are only fallback defaults.
+- Session persistence: every heartbeat also uploads the account's
+  current StringSession to the Worker, which stores it in KV and
+  hands it back in /pending; on startup the monitor prefers the KV
+  copy over the SESSION_STRING env vars, so a stateless container
+  restart keeps its sessions. If a session dies for good (e.g. the
+  same auth key used from two IPs at once), the monitor alerts
+  "会话失效" and waits for /remove_account + /add_account instead of
+  crash-looping.
 - Sustain flood （持续Flood保护）: optional timer (once / loop / count
   modes) that automatically re-triggers the 2FA flood protection; off by
   default. Manual /check_flood always sends one fresh code request to
@@ -86,6 +94,7 @@ from datetime import datetime, timedelta, timezone
 from telethon import TelegramClient, events
 from telethon import password as pwd_mod
 from telethon.errors import (
+    AuthKeyDuplicatedError,
     FloodWaitError,
     PasswordHashInvalidError,
     PhoneCodeExpiredError,
@@ -108,7 +117,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("tg-guardian-mtproto")
 
-VERSION = "v0.5.21"
+VERSION = "v0.5.22"
 
 def norm_phone(p) -> str:
     """Digits-only phone. The Worker normalizes phones to digits-only,
@@ -130,10 +139,15 @@ OWNER_ID = os.environ.get("OWNER_ID", "").strip()
 PHONE = norm_phone(os.environ.get("PHONE", ""))
 SESSION_STRING = os.environ.get("SESSION_STRING", "").strip()
 
-def account_session(phone: str, session_name: str):
-    """Return a StringSession from SESSION_STRING_<phone> if set (stateless
-    hosting, e.g. a container with no persistent disk), else the file
-    session name. The main account uses the plain SESSION_STRING var."""
+def account_session(phone: str, session_name: str, kv_string: str = ""):
+    """Return the session to log in with, in priority order: the
+    StringSession stored in the Worker KV (written by the running monitor
+    on every heartbeat, so a stateless container restart keeps its
+    sessions), then SESSION_STRING_<phone> from the environment (seed /
+    migration), else the file session name. The main account's env seed
+    is the plain SESSION_STRING var (handled in main())."""
+    if kv_string:
+        return StringSession(kv_string)
     ss = os.environ.get(f"SESSION_STRING_{phone}", "").strip()
     if ss:
         return StringSession(ss)
@@ -1552,13 +1566,24 @@ async def upload_heartbeat(acct: Acct) -> None:
     try:
         result = await acct.client(GetAuthorizationsRequest())
         auths = list(result.authorizations)
-        data = post_worker("/heartbeat", {
+        payload = {
             "account": acct.phone,
             "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "version": VERSION,
             "count": len(auths),
             "sessions": [format_session(a) for a in auths],
-        })
+        }
+        # Keep the Worker KV copy of this account's StringSession fresh so
+        # a stateless container restart can restore the session (v0.5.22).
+        # Sent with every heartbeat (not deduped) so the copy lands even
+        # if the Worker was upgraded after this monitor started.
+        try:
+            ss = StringSession.save(acct.client.session)
+        except Exception:  # noqa: BLE001
+            ss = ""
+        if ss:
+            payload["session_string"] = ss
+        data = post_worker("/heartbeat", payload)
         if data and data.get("ok"):
             log.info("[%s] Heartbeat uploaded: %d session(s).", acct.phone, len(auths))
         else:
@@ -1654,6 +1679,10 @@ async def _finish_onboard(acct: Acct) -> None:
     acct.onboard_code_hash = None
     log.info("[%s] Onboarding complete, account is now monitored.", acct.phone)
     report_onboard(acct.phone, "done")
+    # Upload the fresh session string to the Worker KV right away so a
+    # container restart before the next hourly heartbeat keeps it.
+    await upload_heartbeat(acct)
+    acct.last_heartbeat = time.time()
 
 
 async def _drop_onboard_client(acct: Acct) -> None:
@@ -1862,7 +1891,8 @@ async def ensure_clients(data: dict) -> None:
         acct = Acct(phone, str(entry.get("name", "") or ""))
         ACCOUNTS[phone] = acct
         try:
-            client = TelegramClient(account_session(phone, acct.session_name), int(API_ID), API_HASH)
+            kv_string = str(((data.get("per_account") or {}).get(phone) or {}).get("session_string") or "")
+            client = TelegramClient(account_session(phone, acct.session_name, kv_string), int(API_ID), API_HASH)
             client.add_event_handler(make_code_handler(acct), events.NewMessage(from_users=777000))
             await client.connect()
             acct.client = client
@@ -1877,6 +1907,9 @@ async def ensure_clients(data: dict) -> None:
                     send_bot_alert(f"⚠️ 账号【{acct.label}】会话失效：先 /remove_account {display_phone(phone)}，再 /add_account {display_phone(phone)}。")
         except Exception as exc:  # noqa: BLE001
             log.warning("[%s] Failed to start monitoring client: %s", phone, exc)
+            if isinstance(exc, AuthKeyDuplicatedError) and phone not in warned:
+                warned.add(phone)
+                send_bot_alert(f"⚠️ 账号【{acct.label}】会话失效：先 /remove_account {display_phone(phone)}，再 /add_account {display_phone(phone)}。")
             ACCOUNTS.pop(phone, None)
     ensure_clients._warned = warned
 
@@ -1906,7 +1939,18 @@ async def main() -> None:
         sys.exit(2)
 
     # Bootstrap the main (seed) account: the original single account.
-    if SESSION_STRING:
+    # Session priority (v0.5.22): the StringSession stored in the Worker
+    # KV (kept fresh by heartbeats), then the SESSION_STRING env seed,
+    # then the legacy session file.
+    kv_string = ""
+    try:
+        boot_data = fetch_pending()
+        kv_string = str(((boot_data.get("per_account") or {}).get(PHONE) or {}).get("session_string") or "")
+    except Exception:  # noqa: BLE001 - fall back to env/file below
+        kv_string = ""
+    if kv_string:
+        session = StringSession(kv_string)
+    elif SESSION_STRING:
         session = StringSession(SESSION_STRING)
     else:
         session = "tg_guardian"
@@ -1917,9 +1961,19 @@ async def main() -> None:
     # Real-time login-code alerts (v0.3): Telegram delivers the code as a
     # 777000 message to this already-logged-in account.
     client.add_event_handler(make_code_handler(main_acct), events.NewMessage(from_users=777000))
-    await client.connect()
     main_acct.client = client
-    if not await client.is_user_authorized():
+    main_authorized = False
+    try:
+        await client.connect()
+        main_authorized = await client.is_user_authorized()
+    except Exception as exc:  # noqa: BLE001 - a dead session must not crash-loop the monitor
+        log.warning("Main account session unusable (%s); staying up for re-login via /remove_account + /add_account.", exc)
+    if not main_authorized and (kv_string or SESSION_STRING):
+        # Stateless hosting: never block on an interactive login; the
+        # owner re-logins through the bot (/remove_account + /add_account).
+        send_bot_alert(f"⚠️ 账号【{main_acct.label}】会话失效：先 /remove_account {display_phone(PHONE)}，再 /add_account {display_phone(PHONE)}。")
+        log.warning("Main account not authorized; monitor stays up for re-login via the bot.")
+    elif not main_authorized:
         if not PHONE:
             log.error(
                 "Not authorized yet. Set SESSION_STRING, or set PHONE and run once "
@@ -1934,12 +1988,16 @@ async def main() -> None:
         except Exception:
             password = input("2FA password: ").strip()
             await client.sign_in(password=password)
+        main_authorized = True
         if SESSION_STRING == "":
             log.info("Authorized. Session saved to tg_guardian.session - keep this file safe, never upload it to GitHub.")
 
-    main_acct.authorized = True
-    me = await client.get_me()
-    log.info("TG Guardian MTProto monitor %s started as %s (id=%s).", VERSION, me.username or me.first_name, me.id)
+    main_acct.authorized = main_authorized
+    if main_authorized:
+        me = await client.get_me()
+        log.info("TG Guardian MTProto monitor %s started as %s (id=%s).", VERSION, me.username or me.first_name, me.id)
+    else:
+        log.info("TG Guardian MTProto monitor %s started (main account awaiting re-login).", VERSION)
     # Adopt a changed main-account number (after /change_phone) before
     # registering, so a stale PHONE env var doesn't re-add the old number.
     try:
@@ -2002,7 +2060,14 @@ async def main() -> None:
                     acct.last_ok = time.time()
                 except Exception as exc:  # noqa: BLE001 - one account's failure must not stop the others
                     log.warning("[%s] Monitor cycle failed, will retry: %s", phone, exc)
-                    if time.time() - acct.last_ok > DISCONNECT_EXIT_AFTER:
+                    if isinstance(exc, AuthKeyDuplicatedError):
+                        # Session permanently dead: stop cycling this account
+                        # and wait for the owner to re-login via the bot.
+                        acct.authorized = False
+                        if not getattr(acct, "_dead_alerted", False):
+                            acct._dead_alerted = True
+                            send_bot_alert(f"⚠️ 账号【{acct.label}】会话失效：先 /remove_account {display_phone(phone)}，再 /add_account {display_phone(phone)}。")
+                    elif time.time() - acct.last_ok > DISCONNECT_EXIT_AFTER:
                         log.error("[%s] No successful cycle for %d s, exiting so the platform restarts the monitor.", phone, DISCONNECT_EXIT_AFTER)
                         os._exit(1)
         except Exception as exc:  # noqa: BLE001 - keep polling through transient errors

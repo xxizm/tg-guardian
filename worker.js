@@ -1,5 +1,5 @@
 /**
- * TG Guardian Worker v1.4.22
+ * TG Guardian Worker v1.4.23
  * Cloudflare Worker + KV (TG_GUARD_DATA) + Telegram Bot API.
  * Env: BOT_TOKEN, OWNER_ID, WEBHOOK_SECRET, KV binding TG_GUARD_DATA.
  * Author: TG https://t.me/ziixiix
@@ -181,9 +181,16 @@
  * the flood line in /status, /security and /accounts shows
  * "循环保护中" instead of the estimated recovery time (the loop
  * re-triggers on its interval, so a recovery estimate is moot).
+ *
+ * SESSION PERSISTENCE (v1.4.23): the monitor uploads its current
+ * StringSession with every heartbeat; the Worker stores it in KV
+ * (acct:<phone>:session_string) and returns it in GET /pending so a
+ * stateless monitor container restores its sessions after a restart
+ * instead of dying with the ephemeral disk. Deleted on
+ * /remove_account, moved on /change_phone.
  */
 
-const VERSION = "1.4.22";
+const VERSION = "1.4.23";
 
 // Wake-up marker (v1.4.9): sent as a short bot message after any decision
 // button tap so the monitor polls /pending immediately instead of waiting
@@ -671,7 +678,7 @@ async function deleteAccountData(env, phone) {
   for (const p of pending) await kvDeleteAcct(env, phone, "pending:" + p.hash);
   const codes = await getCodeEvents(env, phone);
   for (const c of codes) await kvDeleteAcct(env, phone, "code:" + c.id);
-  for (const key of ["pending_index", "code_index", "code_frozen", "alerts", "sessions", "mtproto_heartbeat", "settings"]) {
+  for (const key of ["pending_index", "code_index", "code_frozen", "alerts", "sessions", "mtproto_heartbeat", "settings", "session_string"]) {
     await kvDeleteAcct(env, phone, key);
   }
 }
@@ -683,7 +690,7 @@ async function migrateAccountData(env, oldPhone, newPhone) {
   // the monitor session stays valid; only TG Guardian's phone-keyed
   // records move). Values are copied as-is: the phone lives in the key
   // prefix, not inside the stored JSON.
-  const fixed = ["pending_index", "code_index", "code_frozen", "alerts", "sessions", "mtproto_heartbeat", "settings", "flood_probe", "flood_triggers", "sustain"];
+  const fixed = ["pending_index", "code_index", "code_frozen", "alerts", "sessions", "mtproto_heartbeat", "settings", "flood_probe", "flood_triggers", "sustain", "session_string"];
   let moved = 0;
   const pending = await getPendingList(env, oldPhone);
   for (const p of pending) {
@@ -1578,6 +1585,7 @@ code_events: await getCodeEvents(env, acct.phone),
 settings: await getSettings(env, acct.phone),
 flood_probe,
 sustain: await getSustain(env, acct.phone),
+session_string: await kvGetAcct(env, acct.phone, "session_string"),
 };
 }
 // Onboard requests: hand secrets to the monitor exactly once.
@@ -1712,6 +1720,11 @@ const at = body.at || new Date().toISOString();
 await kvPutAcct(env, phone, "mtproto_heartbeat", at);
 if (Array.isArray(body.sessions) && body.sessions.length) {
 await kvPutAcct(env, phone, "sessions", JSON.stringify(body.sessions));
+}
+// Session persistence (v1.4.23): keep the monitor's current StringSession
+// in KV so a stateless container restart can restore it.
+if (typeof body.session_string === "string" && body.session_string) {
+await kvPutAcct(env, phone, "session_string", body.session_string);
 }
 return Response.json({ ok: true});
 }
