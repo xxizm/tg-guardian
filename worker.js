@@ -1,5 +1,5 @@
 /**
- * TG Guardian Worker v1.4.25
+ * TG Guardian Worker v1.4.26
  * Cloudflare Worker + KV (TG_GUARD_DATA) + Telegram Bot API.
  * Env: BOT_TOKEN, OWNER_ID, WEBHOOK_SECRET, KV binding TG_GUARD_DATA.
  * Author: TG https://t.me/ziixiix
@@ -19,6 +19,7 @@
  *   /code <验证码>               -> monitor finishes the login
  *   /2fa <二级密码>             -> only if the account has 2FA
  *   /cancel_add <手机号>         -> abort an in-progress add
+ *   /stop_qr [账号]              -> stop an in-progress QR login
  *   /accounts                    -> list accounts and their state
  *   /remove_account <手机号>     -> delete an account (two-step confirm)
  * The code / 2FA password travel through the bot and KV only until the
@@ -211,9 +212,16 @@
  * deletes the onboard record; the monitor stops the QR task when
  * the record disappears. /remove_account no longer refuses to
  * delete the last account; zero accounts is a valid state.
+ *
+ * MENU TRIM + /stop_qr (v1.4.26): the Telegram command menu
+ * (setMyCommands) now lists only /start and /help - every other
+ * command still works when typed and stays documented in /help.
+ * New /stop_qr [account] stops an in-progress QR login from text,
+ * the same as the stop button under each QR photo (deletes the
+ * onboard record and wakes the monitor).
  */
 
-const VERSION = "1.4.25";
+const VERSION = "1.4.26";
 
 // Wake-up marker (v1.4.9): sent as a short bot message after any decision
 // button tap so the monitor polls /pending immediately instead of waiting
@@ -496,6 +504,7 @@ const HELP_TEXT =
   "/code <验证码> — 添加账号时提交验证码\n" +
   "/2fa <二级密码> — 添加账号时提交二级密码\n" +
   "/cancel_add <手机号> — 取消正在添加的账号\n" +
+  "/stop_qr [账号] — 停止扫码登录\n" +
   "/remove_account <手机号> — 删除一个账号\n\n" +
   "📋 状态查询（多账号时需指定账号，如 /status +8613800138000）\n" +
   "/status — 整体状态\n" +
@@ -540,35 +549,10 @@ const KEYBOARD = {
 
 // Bottom-left command menu (Telegram setMyCommands). Stored server-side by
 // Telegram, so it survives clearing the chat history. Set once per /start.
+// v1.4.26: only /start and /help are listed here; every other command
+// still works when typed and is documented in /help (HELP_TEXT).
 const BOT_COMMANDS = [
   { command: "start", description: "启动机器人" },
-  { command: "accounts", description: "账号列表和状态" },
-  { command: "add_account", description: "添加一个账号（短信/扫码）" },
-  { command: "code", description: "添加账号时提交验证码" },
-  { command: "2fa", description: "添加账号时提交二级密码" },
-  { command: "cancel_add", description: "取消正在添加的账号" },
-  { command: "remove_account", description: "删除一个账号" },
-  { command: "rename_account", description: "改账号名字" },
-  { command: "status", description: "整体状态" },
-  { command: "security", description: "安全状态" },
-  { command: "devices", description: "已登录设备" },
-  { command: "logs", description: "最近告警" },
-  { command: "login_guard", description: "反登录防护状态" },
-  { command: "flood_status", description: "已记录的 Flood 状态" },
-  { command: "security_check", description: "检查防护系统配置" },
-  { command: "alert_on", description: "开启安全异常告警" },
-  { command: "alert_off", description: "关闭安全异常告警" },
-  { command: "pause_guard", description: "暂停保护（可加账号和分钟）" },
-  { command: "resume_guard", description: "恢复保护" },
-  { command: "clear_alerts", description: "手动清空最近告警" },
-  { command: "clear_flood", description: "手动清除 Flood 记录" },
-  { command: "check_flood", description: "手动检查 Flood 是否恢复" },
-  { command: "set_guard", description: "设置自动冻结时间（秒）" },
-  { command: "set_revoke", description: "设置自动注销时间（秒）" },
-  { command: "sustain_flood_on", description: "开启持续Flood保护（定时触发）" },
-  { command: "sustain_flood_off", description: "关闭持续Flood保护" },
-  { command: "test", description: "KV 读写测试" },
-  { command: "ping", description: "机器人是否在线" },
   { command: "help", description: "显示帮助" },
 ];
 
@@ -987,7 +971,7 @@ async function accountSummary(env, acct) {
   };
 }
 
-async function runCommand(env, chatId, fromId, rawText) {
+async function runCommand(env, chatId, fromId, rawText, ctx) {
   const text = (rawText || "").trim();
   const cmd = text.split(/\s+/)[0].toLowerCase().replace(/@.*$/, "");
   const args = text.split(/\s+/).slice(1);
@@ -1131,6 +1115,35 @@ async function runCommand(env, chatId, fromId, rawText) {
     delete item.password;
     await saveOnboard(env, onboard);
     return sendMessage(env, chatId, `正在取消添加账号 ${displayPhone(phone)}…`, true);
+  }
+  if (cmd === "/stop_qr") {
+    const onboard = await getOnboard(env);
+    const qrActive = (o) => o.mode === "qr" && o.state !== "cancelled";
+    let item = null;
+    if (args.length) {
+      item = findAccount(onboard, args[0]) || findAccount(onboard, args.join(" "));
+      if (!item) {
+        return sendMessage(env, chatId, `没找到正在添加的账号「${args.join(" ")}」，发 /accounts 看看。`, true);
+      }
+      if (!qrActive(item)) {
+        if (item.mode === "qr") {
+          return sendMessage(env, chatId, `账号【${accountLabel(item)}】正在取消…`, true);
+        }
+        return sendMessage(env, chatId, `账号【${accountLabel(item)}】不是扫码登录，取消添加请发 /cancel_add ${displayPhone(item.phone)}。`, true);
+      }
+    } else {
+      const qrItems = onboard.filter(qrActive);
+      if (!qrItems.length) {
+        return sendMessage(env, chatId, "现在没有正在进行的扫码登录。", true);
+      }
+      if (qrItems.length > 1) {
+        return sendMessage(env, chatId, "有多个扫码登录在进行，请指定一个：\n" + qrItems.map((o) => `· ${accountLabel(o)} — ${displayPhone(o.phone)}`).join("\n"), true);
+      }
+      item = qrItems[0];
+    }
+    await saveOnboard(env, onboard.filter((o) => o.phone !== item.phone));
+    if (ctx) ctx.waitUntil(sendWakeup(env));
+    return sendMessage(env, chatId, `🛑 已停止扫码登录【${displayPhone(item.phone)}】。重新添加发 /add_account ${displayPhone(item.phone)}。`, true);
   }
   if (cmd === "/remove_account") {
     const phone = normalizePhone(args[0]);
@@ -2132,13 +2145,13 @@ if (data.startsWith("onboard:code:")) { const phone = normalizePhone(data.slice(
 if (data.startsWith("onboard:qr:")) { const phone = normalizePhone(data.slice("onboard:qr:".length)); const onboard = phone ? await getOnboard(env) : []; const item = onboard.find((o) => o.phone === phone); if (item && item.state === "choose_method") { item.mode = "qr"; item.state = "qr_pending"; await saveOnboard(env, onboard); await answerCallback(env, cb.id, "扫码登录"); await sendMessage(env, cb.message.chat.id, `📷 扫码登录【${displayPhone(phone)}】\n需要两个设备：一台显示二维码、一台扫码。\n二维码 30 秒有效，过期自动刷新（最多 10 次）。\n监控端马上发二维码，请用这个账号的 Telegram 扫（设置 → 设备 → 链接桌面设备）。\n取消：点二维码下的「停止扫码登录」，或发 /cancel_add ${displayPhone(phone)}`, true); ctx.waitUntil(sendWakeup(env)); } else { await answerCallback(env, cb.id, "这个添加已经处理过了"); } return; }
 const cmd = data.startsWith("cmd:")? data.slice(4): data;
 await answerCallback(env, cb.id);
-await runCommand(env, cb.message.chat.id, cb.from.id, cmd);
+await runCommand(env, cb.message.chat.id, cb.from.id, cmd, ctx);
 })());
 return Response.json({ ok: true});
 }
 const msg = update.message || update.edited_message;
 if (msg && msg.chat) {
-ctx.waitUntil(runCommand(env, msg.chat.id, msg.from && msg.from.id, msg.text || ""));
+ctx.waitUntil(runCommand(env, msg.chat.id, msg.from && msg.from.id, msg.text || "", ctx));
 }
 return Response.json({ ok: true});
 }

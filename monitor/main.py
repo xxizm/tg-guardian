@@ -1,5 +1,5 @@
 """
-TG Guardian MTProto Monitor v0.5.25
+TG Guardian MTProto Monitor v0.5.26
 Author: TG https://t.me/ziixiix
 - Logs in as the user's own Telegram account(s) (Telethon / MTProto).
 - MULTI-ACCOUNT (v0.5.0): one process watches several Telegram accounts
@@ -122,7 +122,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("tg-guardian-mtproto")
 
-VERSION = "v0.5.25"
+VERSION = "v0.5.26"
 
 def norm_phone(p) -> str:
     """Digits-only phone. The Worker normalizes phones to digits-only,
@@ -434,6 +434,11 @@ WAKEUP_MARKER = "⚡ TG Guardian：正在唤醒监控端"
 # backstop; the shared apply_* helpers dedupe, so a decision is never
 # executed twice.
 DIRECT_QUEUE: list = []
+# Serializes process_onboard (v0.5.26): the main loop runs it every
+# poll, and the wake-up handler also runs it immediately on fresh
+# data, so a tapped stop/cancel halts the QR task within seconds
+# even while the main loop is mid-cycle.
+_ONBOARD_LOCK = asyncio.Lock()
 DIRECT_KINDS = {
     "allow": "device",
     "revoke": "device",
@@ -544,7 +549,10 @@ def make_wakeup_handler(bot_id: int):
     bot's other messages (alerts, results) never wake the loop. Since
     v0.5.9 the wake-up may also carry the decision itself (second line
     "kind:phone:id:ts"); the handler only enqueues it — the main loop
-    executes it, so it can never race the poll path.
+    executes it, so it can never race the poll path. Since v0.5.26 the
+    handler also schedules an immediate onboard check (process_onboard
+    on fresh data, serialized by _ONBOARD_LOCK) so a tapped stop/cancel
+    halts the QR task within seconds.
     """
     async def on_wakeup(event) -> None:
         text = event.raw_text or ""
@@ -554,6 +562,7 @@ def make_wakeup_handler(bot_id: int):
                 DIRECT_QUEUE.append(directive)
                 log.info("Wake-up with direct decision received: %s %s %s.", *directive)
             WAKEUP.set()
+            asyncio.create_task(_run_onboard_check())
             log.info("Wake-up received, polling /pending now.")
     return on_wakeup
 
@@ -1815,6 +1824,34 @@ async def _qr_2fa(acct: Acct, client) -> bool:
             return False
 
 
+def _qr_still_active(phone: str) -> bool:
+    """Fresh /pending check for the QR loop (v0.5.26): the onboard
+    record must still exist in QR mode before another photo is sent.
+    The stop button deletes the record in the Worker, but the KV
+    delete can take a while to show up in /pending reads, so the
+    loop re-checks before every photo instead of trusting the data
+    it started with. A failed fetch returns True (unknown - the
+    process_onboard cancel paths remain the backstop)."""
+    data = fetch_pending()
+    if not data:
+        return True
+    for item in data.get("onboard", []) or []:
+        if norm_phone(item.get("phone", "")) == norm_phone(phone):
+            return str(item.get("mode", "") or "") == "qr" and item.get("state") != "cancelled"
+    return False
+
+
+async def _run_onboard_check() -> None:
+    """Run process_onboard once on fresh /pending data (v0.5.26).
+    The wake-up handler schedules this so a tapped stop/cancel halts
+    the QR task within seconds, even while the main loop is busy
+    with a check cycle. Serialized with the main loop's own
+    process_onboard call via _ONBOARD_LOCK."""
+    async with _ONBOARD_LOCK:
+        data = fetch_pending()
+        await process_onboard(data)
+
+
 async def run_qr_onboard(acct: Acct) -> None:
     """QR-login onboarding as a background task: send QR photos to
     the owner until one is scanned (30 s each, up to QR_MAX_REFRESH
@@ -1846,7 +1883,18 @@ async def run_qr_onboard(acct: Acct) -> None:
             await _finish_onboard(acct)
             return
         refreshes = 0
+        photos_sent = 0
         while True:
+            # v0.5.26: before each refresh, confirm the onboard record
+            # still exists - the stop button deletes it, and a KV-stale
+            # /pending at wake-up time must not keep the photos coming.
+            # The first photo skips the check: process_onboard just
+            # validated the record, and a lagging read must not kill a
+            # fresh flow (the task is not restarted for the same record).
+            if photos_sent >= 1 and not _qr_still_active(phone):
+                log.info("[%s] QR onboarding stopped (record gone).", phone)
+                await _drop_onboard_client(acct)
+                return
             qr = await client.qr_login()
             caption = (
                 f"📷 账号【{acct.label}】扫码登录（第 {refreshes + 1} 张）\n"
@@ -1854,6 +1902,7 @@ async def run_qr_onboard(acct: Acct) -> None:
                 "用这个账号的 Telegram：设置 → 设备 → 链接桌面设备。"
             )
             send_qr_photo(_qr_png(qr.url), caption, phone)
+            photos_sent += 1
             try:
                 await qr.wait(timeout=QR_WAIT_TIMEOUT)
                 break
@@ -2304,7 +2353,8 @@ async def main() -> None:
                 await execute_directive(kind, phone, ident, data)
             await sync_main_phone(data)
             await ensure_clients(data)
-            await process_onboard(data)
+            async with _ONBOARD_LOCK:
+                await process_onboard(data)
             await cleanup_accounts(data)
             # Re-register the main account if the Worker has no accounts
             # yet (e.g. KV was wiped), at most once an hour.
