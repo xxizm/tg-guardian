@@ -1,5 +1,5 @@
 /**
- * TG Guardian Worker v1.4.21
+ * TG Guardian Worker v1.4.22
  * Cloudflare Worker + KV (TG_GUARD_DATA) + Telegram Bot API.
  * Env: BOT_TOKEN, OWNER_ID, WEBHOOK_SECRET, KV binding TG_GUARD_DATA.
  * Author: TG https://t.me/ziixiix
@@ -176,9 +176,14 @@
  *
  * HELP (v1.4.21): /change_phone is now listed in /help (account
  * management section).
+ *
+ * LOOP DISPLAY (v1.4.22): for an account with sustain loop mode on,
+ * the flood line in /status, /security and /accounts shows
+ * "循环保护中" instead of the estimated recovery time (the loop
+ * re-triggers on its interval, so a recovery estimate is moot).
  */
 
-const VERSION = "1.4.21";
+const VERSION = "1.4.22";
 
 // Wake-up marker (v1.4.9): sent as a short bot message after any decision
 // button tap so the monitor polls /pending immediately instead of waiting
@@ -873,27 +878,28 @@ if (!o || o === "未执行") return "未触发";
 return o;
 }
 
-function frozenLine(f) {
-  if (!f) return "未冻结";
+function frozenLine(f, loop) {
+  if (!f) return loop ? "循环保护中" : "未冻结";
   if (f.broken) return "已冻结（记录损坏）";
   const rec = fmtTime(f.expected_recovery_at);
+  const recText = loop ? "循环保护中" : `预计恢复：${rec}`;
   const ct = codeTriggered(f);
   const tt = twofaTriggered(f);
   let line;
   if (f.mode === "2fa") {
-    line = tt ? `Flood保护已触发，预计恢复：${rec}` : "Flood保护未触发";
+    line = tt ? `Flood保护已触发，${recText}` : "Flood保护未触发";
   } else if (f.mode === "code") {
-    line = ct ? `验证码已冻结，预计恢复：${rec}` : "验证码冻结未触发";
+    line = ct ? `验证码已冻结，${recText}` : "验证码冻结未触发";
   } else if (f.mode === "both") {
-    if (ct && tt) line = `验证码 + Flood保护已触发，预计恢复：${rec}`;
-    else if (ct) line = `验证码已冻结，预计恢复：${rec}；Flood保护未触发`;
-    else if (tt) line = `Flood保护已触发，预计恢复：${rec}；验证码冻结未触发`;
+    if (ct && tt) line = `验证码 + Flood保护已触发，${recText}`;
+    else if (ct) line = `验证码已冻结，${recText}；Flood保护未触发`;
+    else if (tt) line = `Flood保护已触发，${recText}；验证码冻结未触发`;
     else line = "验证码 + Flood保护均未触发";
   } else {
-    line = `已冻结，预计恢复：${rec}`;
+    line = `已冻结，${recText}`;
   }
   const recMs = f.expected_recovery_at ? Date.parse(f.expected_recovery_at) : NaN;
-  if (Number.isFinite(recMs) && Date.now() > recMs && (ct || tt)) line += "（已过预计恢复时间）";
+  if (!loop && Number.isFinite(recMs) && Date.now() > recMs && (ct || tt)) line += "（已过预计恢复时间）";
   if (f.twofa_outcome && /不需要二级密码|未设二级密码/.test(f.twofa_outcome)) line += "；账号未设二级密码";
   if (!ct && f.outcome) line += `；验证码：${f.outcome}`;
   return line;
@@ -909,6 +915,7 @@ async function accountSummary(env, acct) {
   const codeEvents = await getCodeEvents(env, phone);
   const openCode = codeEvents.filter((c) => c.status === "pending");
   const f = await frozenInfo(env, phone);
+  const sustainRec = await getSustain(env, phone);
   const hb = await kvGetAcct(env, phone, "mtproto_heartbeat");
   const hbMs = hb ? Date.parse(hb) : NaN;
   const hbAgeMin = Number.isFinite(hbMs) ? Math.round((Date.now() - hbMs) / 60000) : null;
@@ -922,6 +929,7 @@ async function accountSummary(env, acct) {
   }
   return {
     acct, settings, guardSec, revokeSec, open, openCode, frozen: f,
+    sustainLoop: !!(sustainRec && sustainRec.mode === "loop"),
     hb, hbAgeMin, sessionCount, sessionsRaw,
   };
 }
@@ -972,7 +980,7 @@ async function runCommand(env, chatId, fromId, rawText) {
       out += `${accountLabel(acct)} — ${displayPhone(acct.phone)}\n` +
         `  设备：${s.sessionCount !== null ? s.sessionCount + " 个" : "未知"} · ${hbLine}\n` +
         `  待确认：新设备 ${s.open.length} 个，验证码请求 ${s.openCode.length} 个\n` +
-        `  Flood：${frozenLine(s.frozen)}\n\n`;
+        `  Flood：${frozenLine(s.frozen, s.sustainLoop)}\n\n`;
     }
     if (onboard.length) {
       out += "⏳ 正在添加：\n";
@@ -1121,7 +1129,7 @@ out += `\n【${accountLabel(acct)}】\n` +
 `设备快照：${s.sessionCount!== null? s.sessionCount + " 个已确认设备": "（快照在服务器本地）"}\n` +
 `待确认的新设备：${s.open.length? s.open.length + ` 个，${s.revokeSec} 秒内没回复会自动注销`: "无"}\n` +
 `待确认的验证码请求：${s.openCode.length? s.openCode.length + ` 个，${s.guardSec} 秒内没回复会自动冻结二级密码`: "无"}\n` +
-`验证码功能：${frozenLine(s.frozen)}\n` +
+`验证码功能：${frozenLine(s.frozen, s.sustainLoop)}\n` +
 `异常告警：${s.settings.alerts_enabled? "开 ✅": "关（只自动处理，不弹窗）"}\n`;
 }
 if (targets.length === 1) {
@@ -1281,7 +1289,7 @@ out += `\n【${accountLabel(acct)}】\n` +
 `异常告警：${s.settings.alerts_enabled? "开 ✅": "关（只自动处理，不弹窗）"}\n` +
 `待确认的新设备：${s.open.length? s.open.length + " 个": "无"}\n` +
 `待确认的验证码请求：${s.openCode.length? s.openCode.length + " 个": "无"}\n` +
-`Flood 状态：${frozenLine(s.frozen)}\n` +
+`Flood 状态：${frozenLine(s.frozen, s.sustainLoop)}\n` +
 `持续Flood保护：${sustainLine(await getSustain(env, acct.phone))}\n`;
 }
 out += "\n改时间：/set_guard <秒> [账号] 改自动冻结时间，/set_revoke <秒> [账号] 改自动注销时间（60–3600 秒，2 分钟内生效）。";
