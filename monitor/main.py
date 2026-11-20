@@ -1,5 +1,5 @@
 """
-TG Guardian MTProto Monitor v0.5.22
+TG Guardian MTProto Monitor v0.5.23
 Author: TG https://t.me/ziixiix
 - Logs in as the user's own Telegram account(s) (Telethon / MTProto).
 - MULTI-ACCOUNT (v0.5.0): one process watches several Telegram accounts
@@ -117,7 +117,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("tg-guardian-mtproto")
 
-VERSION = "v0.5.22"
+VERSION = "v0.5.23"
 
 def norm_phone(p) -> str:
     """Digits-only phone. The Worker normalizes phones to digits-only,
@@ -1705,6 +1705,24 @@ async def _drop_onboard_client(acct: Acct) -> None:
         pass
 
 
+async def _ensure_onboard_client(acct: Acct) -> None:
+    """Make sure the account has a live client for onboarding.
+
+    A restored session (env / KV / file) that is not authorized may be
+    dead for good (e.g. its auth key was used from two IPs at once);
+    onboarding needs a brand-new session, so drop such a client (and
+    its session file) and create a fresh one. A client already in the
+    middle of onboarding is kept as is."""
+    if acct.client is not None and not acct.authorized and acct.onboard_client is None:
+        await _drop_onboard_client(acct)
+    if acct.client is None:
+        client = TelegramClient(acct.session_name, int(API_ID), API_HASH)
+        client.add_event_handler(make_code_handler(acct), events.NewMessage(from_users=777000))
+        await client.connect()
+        acct.client = client
+        acct.onboard_client = client
+
+
 async def process_onboard(data: dict) -> None:
     """Drive /add_account onboarding: send the code, sign in with the
     code the owner sends via /code, then with the 2FA password via /2fa.
@@ -1730,12 +1748,7 @@ async def process_onboard(data: dict) -> None:
             ACCOUNTS[phone] = acct
         try:
             if state == "pending_send":
-                if acct.client is None:
-                    client = TelegramClient(acct.session_name, int(API_ID), API_HASH)
-                    client.add_event_handler(make_code_handler(acct), events.NewMessage(from_users=777000))
-                    await client.connect()
-                    acct.client = client
-                    acct.onboard_client = client
+                await _ensure_onboard_client(acct)
                 if await acct.client.is_user_authorized():
                     await _finish_onboard(acct)
                     continue
@@ -1760,12 +1773,7 @@ async def process_onboard(data: dict) -> None:
                     # the code was requested): request a fresh code and ask
                     # the owner to send the new one.
                     try:
-                        if acct.client is None:
-                            client = TelegramClient(acct.session_name, int(API_ID), API_HASH)
-                            client.add_event_handler(make_code_handler(acct), events.NewMessage(from_users=777000))
-                            await client.connect()
-                            acct.client = client
-                            acct.onboard_client = client
+                        await _ensure_onboard_client(acct)
                         sent = await acct.client.send_code_request(phone)
                         acct.onboard_code_hash = sent.phone_code_hash
                     except FloodWaitError as exc:
