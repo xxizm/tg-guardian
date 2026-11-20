@@ -1,19 +1,6 @@
 """
-TG Guardian MTProto Monitor v0.5.18
+TG Guardian MTProto Monitor v0.5.21
 Author: TG https://t.me/ziixiix
-  777000 message with 5-6 digits counts (the handler is already restricted
-  to sender 777000). Added poll_777000: every session check also reads the
-  latest 777000 messages, so a code the event stream missed is still caught
-  within one 5-minute cycle.
-  did not trigger (e.g. the account has no 2FA, so the wrong-2FA path cannot
-  run) no longer records a bogus 24h recovery time, and the Worker no longer
-  displays it as triggered.
-  Internal keys stay digits-only (see v0.5.1).
-  main account by the raw PHONE env ("+167...") while the Worker lists
-  phones digits-only ("167..."), so ensure_clients treated the main
-  account as a second, unknown account, created a phantom unauthorized
-  client and sent a false "session invalid" alert. Fixed by normalizing
-  every phone at every boundary (env, Worker payloads, state file keys).
 - Logs in as the user's own Telegram account(s) (Telethon / MTProto).
 - MULTI-ACCOUNT (v0.5.0): one process watches several Telegram accounts
   that all belong to the same owner. Each account has its own
@@ -40,79 +27,45 @@ Author: TG https://t.me/ziixiix
     - owner taps 踢掉      -> session is revoked immediately
     - no reply in 10 min  -> session is revoked automatically
   The monitor's own session is in the trusted baseline and is never revoked.
-  real time. A half-finished login (correct code, wrong 2FA password)
-  never becomes an authorized session, so session polling cannot see it —
-  but the code message arrives the moment the code is requested, so the
-  monitor alerts immediately. The alert and the logs NEVER include the
-  code digits themselves.
-  ⛔ 拒绝 buttons. If the owner taps 拒绝, the monitor tries to freeze
-  code delivery: a separate throwaway client requests ONE code and enters
-  a deliberately wrong code 5 times against it, aiming to trigger
-  Telegram's wrong-code limit (account can't receive/send codes for ~1h;
-  recovery time is recorded as an estimate). The freeze never touches
-  the monitor's own session, and the throwaway session file is deleted
-  after. While a freeze runs, code alerts are suppressed for 15 min
-  because the freeze itself generates a code message.
-  state file, wiping "code_processed", so a denied code event was frozen
-  again on every 120 s poll. State saves now merge, and frozen event ids
-  are also kept in memory for the process lifetime.
-  and the current device snapshot to the Worker (/heartbeat), so /status
-  shows the monitor is alive and /devices shows the snapshot. 2 KV writes
-  per hour = 48/day, far under the free 1,000/day limit. Also: a code
-  request with no owner reply in 10 min is auto-frozen, same as the
-  new-device auto-revoke.
-  no VERSION constant existed (NameError), so the hourly heartbeat never
-  uploaded. The constant is defined now.
-  app/country/region/created/active/current) so the Worker can render the
-  snapshot as short readable lines instead of the raw pipe-separated
-  dump.
-  monitor's own already-authorized session (no tdata needed, no fresh
-  code requested): it calls account.GetPassword + auth.CheckPassword
-  with a deliberately wrong 2FA password 5 times. Whether Telegram
-  counts those attempts toward the login flood is NOT verified — the
-  only verified trigger is the login flow — so if the no-code path does
-  not return an explicit flood, the monitor falls back to the login-flow
-  path (fresh code entered correctly, then wrong 2FA 5 times). The
-  result alert says which path ran. The uploaded tdata bundle is NOT
-  used: it is a live login key, and the monitor already holds its own
-  authorized session that can do everything an authorized session can
-  do, so copying the tdata to the server would add risk and no
-  capability. Never upload a tdata bundle anywhere.
-  auto_code_after / auto_revoke_after (seconds) and alerts_enabled from
-  the Worker's /pending response on every poll (settings live in Worker
-  KV, changed with /set_guard and /set_revoke; env vars remain the
-  fallback defaults). Alert texts use the configured minutes instead
-  of fixed "5 分钟" / "10 分钟".
-  buttons: ✅ 同意 / 🧊 拒绝·冻结验证码 / 🔒 拒绝·冻结二级密码.
-  deny_code runs only the wrong-code freeze; deny_2fa runs only the 2FA
-  protection; a legacy "deny" (Worker <= 1.3.7, one 拒绝 button) still
-  runs both. No reply in 5 min auto-runs the 2FA protection ONLY, because
-  its block lasts until next day while the code-request block often
-  clears sooner. The /code-freeze report now carries a mode field
-  ("code" / "2fa" / "both") so the Worker can display which protection ran.
-  5 min of silence (AUTO_CODE_AFTER=300, separate from the 10 min
-  new-device auto-revoke):
-  (1) 2FA protection FIRST — a throwaway client requests ONE fresh code,
-      the monitor captures that code from its own 777000 message (in
-      memory only, never logged, never sent anywhere), enters it
-      correctly to reach the 2FA step, then enters a deliberately wrong
-      2FA password 5 times to trigger PHONE_PASSWORD_FLOOD (recovery time estimated by trigger count in 24h: 1st-3rd 1h, 4th 6h, 5th+ 24h).
-      If the code is somehow accepted without 2FA, the throwaway client
-      logs out immediately and aborts.
-  (2) Code freeze — the existing wrong-code freeze (ONE code, entered
-      wrong 5 times). It runs after the 2FA protection; if the account
-      is already flooded by step (1), its code request may be refused
-      with FloodWait — that is reported honestly, not treated as a
-      failure of the protection, because the account is already locked.
-  Either layer also locks the owner out of new-device logins for the
-  same period; already-logged-in sessions are unaffected.
+- Login-code watch: also listens in real time for Telegram's own 777000
+  login-code messages (any 5-6 digit code from sender 777000 counts;
+  every session check also polls the latest 777000 messages as a backup).
+  A half-finished login (correct code, wrong 2FA password) never becomes
+  an authorized session, so session polling cannot see it — but the code
+  message arrives the moment the code is requested, so the monitor alerts
+  immediately. The alert and the logs NEVER include the code digits
+  themselves.
+- Code protection: the Worker code alert has three buttons:
+  ✅ 同意 / 🧊 拒绝·冻结验证码 / 🔒 拒绝·冻结二级密码. No reply in 5 min
+  auto-runs the 2FA protection only. The 2FA protection first tries a
+  no-code path on the monitor's own authorized session (GetPassword +
+  CheckPassword with a deliberately wrong 2FA password 5 times) and falls
+  back to the login-flow path (fresh code entered correctly, then wrong
+  2FA 5 times) to trigger PHONE_PASSWORD_FLOOD. The wrong-code freeze
+  enters one code wrong 5 times to trigger Telegram's wrong-code limit.
+  Either layer also locks the owner out of new-device logins for the same
+  period; already-logged-in sessions are unaffected. Never upload a tdata
+  bundle anywhere: it is a live login key, and the monitor already holds
+  its own authorized session.
+- Hourly heartbeat uploads a device snapshot to the Worker (/heartbeat),
+  so /status shows the monitor is alive and /devices shows the snapshot.
+  Settings (auto_code_after / auto_revoke_after in seconds,
+  alerts_enabled) are read from the Worker's /pending response on every
+  poll; env vars are only fallback defaults.
+- Sustain flood （持续Flood保护）: optional timer (once / loop / count
+  modes) that automatically re-triggers the 2FA flood protection; off by
+  default. Manual /check_flood always sends one fresh code request to
+  probe the real flood state and reports the result to the Worker so the
+  panel reflects the measured state.
 - KV writes happen only on new-device events (via the Worker), never on
   every poll, so the Cloudflare free KV write limit is not a problem.
 
-Env vars (set in Enzonic Startup / Variables, never commit them):
+Env vars (set in your host's environment variables, never commit them):
   API_ID, API_HASH, BOT_TOKEN, OWNER_ID
   PHONE            main account's phone; also the seed account
   SESSION_STRING   optional, Telethon StringSession (avoids interactive login)
+  SESSION_STRING_<phone> optional per-account StringSession for stateless
+                   hosting (survives restarts without session files)
   CHECK_INTERVAL   seconds between session checks, default 300
   POLL_INTERVAL    seconds between decision polls, default 120
   AUTO_REVOKE_AFTER seconds of silence before auto-revoke, default 600
