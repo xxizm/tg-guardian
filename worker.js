@@ -1,5 +1,5 @@
 /**
- * TG Guardian Worker v1.4.27
+ * TG Guardian Worker v1.4.28
  * Cloudflare Worker + KV (TG_GUARD_DATA) + Telegram Bot API.
  * Env: BOT_TOKEN, OWNER_ID, WEBHOOK_SECRET, KV binding TG_GUARD_DATA.
  * Author: TG https://t.me/ziixiix
@@ -225,9 +225,14 @@
  * re-setting the default [start, help] list, and sets the chat menu
  * button to "commands" so clients show it by the input field. It
  * runs on /start AND /help; failures are logged, never thrown.
+ *
+ * FULL MENU RESTORED (v1.4.28): the v1.4.26 menu trim was
+ * reverted at the owner's request - setMyCommands again lists
+ * every command (30, incl. /stop_qr), so typing "/" in the
+ * client shows them all. ensureMenu behavior is unchanged.
  */
 
-const VERSION = "1.4.27";
+const VERSION = "1.4.28";
 
 // Wake-up marker (v1.4.9): sent as a short bot message after any decision
 // button tap so the monitor polls /pending immediately instead of waiting
@@ -555,10 +560,38 @@ const KEYBOARD = {
 
 // Bottom-left command menu (Telegram setMyCommands). Stored server-side by
 // Telegram, so it survives clearing the chat history. Set on /start and /help.
-// v1.4.26: only /start and /help are listed here; every other command
-// still works when typed and is documented in /help (HELP_TEXT).
+// v1.4.28: the full command list is back (the v1.4.26 trim to
+// /start + /help was reverted at the owner's request).
 const BOT_COMMANDS = [
   { command: "start", description: "启动机器人" },
+  { command: "accounts", description: "账号列表和状态" },
+  { command: "add_account", description: "添加一个账号（短信/扫码）" },
+  { command: "code", description: "添加账号时提交验证码" },
+  { command: "2fa", description: "添加账号时提交二级密码" },
+  { command: "cancel_add", description: "取消正在添加的账号" },
+  { command: "stop_qr", description: "停止扫码登录" },
+  { command: "remove_account", description: "删除一个账号" },
+  { command: "rename_account", description: "改账号名字" },
+  { command: "status", description: "整体状态" },
+  { command: "security", description: "安全状态" },
+  { command: "devices", description: "已登录设备" },
+  { command: "logs", description: "最近告警" },
+  { command: "login_guard", description: "反登录防护状态" },
+  { command: "flood_status", description: "已记录的 Flood 状态" },
+  { command: "security_check", description: "检查防护系统配置" },
+  { command: "alert_on", description: "开启安全异常告警" },
+  { command: "alert_off", description: "关闭安全异常告警" },
+  { command: "pause_guard", description: "暂停保护（可加账号和分钟）" },
+  { command: "resume_guard", description: "恢复保护" },
+  { command: "clear_alerts", description: "手动清空最近告警" },
+  { command: "clear_flood", description: "手动清除 Flood 记录" },
+  { command: "check_flood", description: "手动检查 Flood 是否恢复" },
+  { command: "set_guard", description: "设置自动冻结时间（秒）" },
+  { command: "set_revoke", description: "设置自动注销时间（秒）" },
+  { command: "sustain_flood_on", description: "开启持续Flood保护（定时触发）" },
+  { command: "sustain_flood_off", description: "关闭持续Flood保护" },
+  { command: "test", description: "KV 读写测试" },
+  { command: "ping", description: "机器人是否在线" },
   { command: "help", description: "显示帮助" },
 ];
 
