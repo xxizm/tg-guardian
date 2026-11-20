@@ -1,5 +1,5 @@
 """
-TG Guardian MTProto Monitor v0.5.24
+TG Guardian MTProto Monitor v0.5.25
 Author: TG https://t.me/ziixiix
 - Logs in as the user's own Telegram account(s) (Telethon / MTProto).
 - MULTI-ACCOUNT (v0.5.0): one process watches several Telegram accounts
@@ -10,9 +10,11 @@ Author: TG https://t.me/ziixiix
   per-account settings read from the Worker. All accounts share one
   API_ID / API_HASH (those identify the app, not the account).
 - New accounts are added from the bot, no server change needed:
-    /add_account <手机号> [名字] -> the monitor sends a login code
-    /code <验证码>               -> the monitor finishes the login
+    /add_account <手机号> [名字] -> pick 短信登录 (login code) or 扫码登录 (QR)
+    /code <验证码>               -> SMS login: the monitor finishes the login
     /2fa <二级密码>             -> only if the account has 2FA
+  QR login needs two devices (one shows the QR, one scans); each QR is
+  valid 30 s and auto-refreshes (max 10 refreshes).
   The monitor polls the Worker's /pending once every 2 minutes and gets ALL
   accounts' data (decisions, onboard requests, settings) in that one
   call, so 5 accounts still cost ~720 requests/day. The code / 2FA
@@ -82,6 +84,7 @@ Env vars (set in your host's environment variables, never commit them):
 """
 import asyncio
 import hashlib
+import io
 import json
 import logging
 import os
@@ -91,10 +94,12 @@ import time
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
+import segno
 from telethon import TelegramClient, events
 from telethon import password as pwd_mod
 from telethon.errors import (
     AuthKeyDuplicatedError,
+    AuthTokenExpiredError,
     FloodWaitError,
     PasswordHashInvalidError,
     PhoneCodeExpiredError,
@@ -117,7 +122,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("tg-guardian-mtproto")
 
-VERSION = "v0.5.24"
+VERSION = "v0.5.25"
 
 def norm_phone(p) -> str:
     """Digits-only phone. The Worker normalizes phones to digits-only,
@@ -222,6 +227,13 @@ class Acct:
         # for /add_account, and the client being authorized.
         self.onboard_code_hash = None
         self.onboard_client = None
+        # QR onboarding (v0.5.25): the background QR-login task, the
+        # 2FA password handed over by process_onboard (memory only),
+        # and which onboard record (created_at) the task was started
+        # for, so a finished task is not restarted for the same record.
+        self.qr_task = None
+        self.qr_password = None
+        self.qr_task_record = None
         self.last_check = 0.0
         self.last_heartbeat = 0.0
         self.last_ok = time.time()  # last successful cycle (disconnect watchdog)
@@ -264,6 +276,47 @@ def send_bot_alert(text: str, acct: Acct = None) -> None:
             log.info("Bot alert sent, HTTP %s", resp.status)
     except Exception as exc:  # noqa: BLE001 - alerting must never kill the monitor
         log.warning("Failed to send bot alert: %s", exc)
+
+
+def send_qr_photo(png: bytes, caption: str, phone: str) -> bool:
+    """Send a QR-login photo to the owner via the Bot API (multipart
+    sendPhoto), with a 停止扫码登录 button under it. The QR token is
+    inside the image only; it is never logged."""
+    if not BOT_TOKEN or not OWNER_ID:
+        log.warning("BOT_TOKEN / OWNER_ID missing, QR photo not sent.")
+        return False
+    boundary = "----tgguardian" + hashlib.sha256(os.urandom(16)).hexdigest()[:24]
+    keyboard = {"inline_keyboard": [[
+        {"text": "🛑 停止扫码登录", "callback_data": f"onboard:qr_stop:{phone}"},
+    ]]}
+    parts = []
+
+    def field(name: str, value: str) -> None:
+        parts.append(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode()
+        )
+
+    field("chat_id", OWNER_ID)
+    field("caption", caption)
+    field("reply_markup", json.dumps(keyboard))
+    parts.append(
+        f'--{boundary}\r\nContent-Disposition: form-data; name="photo"; '
+        f'filename="qr.png"\r\nContent-Type: image/png\r\n\r\n'.encode()
+    )
+    parts.append(png)
+    parts.append(f"\r\n--{boundary}--\r\n".encode())
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
+        data=b"".join(parts),
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            log.info("QR photo sent, HTTP %s", resp.status)
+            return resp.status == 200
+    except Exception as exc:  # noqa: BLE001 - a failed photo must not kill the QR task
+        log.warning("Failed to send QR photo: %s", exc)
+        return False
 
 
 def post_worker(path: str, payload: dict):
@@ -1712,6 +1765,153 @@ async def process_pending(acct: Acct, data: dict) -> None:
             await apply_device_decision(acct, h, "revoke", status == "pending", auto_revoke_after)
 
 
+# QR onboarding (v0.5.25): each QR token lives ~30 s; the monitor
+# regenerates and re-sends the photo up to QR_MAX_REFRESH times after
+# the first one (~5.5 min total), then gives up. The 2FA password is
+# awaited for up to QR_2FA_TIMEOUT seconds after a successful scan.
+QR_MAX_REFRESH = 10
+QR_WAIT_TIMEOUT = 30
+QR_2FA_TIMEOUT = 300
+
+
+def _qr_png(url: str) -> bytes:
+    """Render the tg://login URL as PNG bytes (segno)."""
+    buf = io.BytesIO()
+    segno.make(url).save(buf, kind="png", scale=8, border=2)
+    return buf.getvalue()
+
+
+async def _qr_2fa(acct: Acct, client) -> bool:
+    """QR scan succeeded but the account has 2FA: ask the owner for
+    the password via the Worker (awaiting_2fa -> /2fa ->
+    password_received, stashed on the Acct by process_onboard) and
+    sign in. Returns True once authorized."""
+    phone = acct.phone
+    while True:
+        report_onboard(phone, "awaiting_2fa")
+        deadline = time.time() + QR_2FA_TIMEOUT
+        while not acct.qr_password:
+            if time.time() > deadline:
+                report_onboard(phone, "failed", "等二级密码超时")
+                await _drop_onboard_client(acct)
+                return False
+            await asyncio.sleep(1)
+        password = acct.qr_password
+        acct.qr_password = None
+        try:
+            await client.sign_in(password=password)
+            return True
+        except PasswordHashInvalidError:
+            report_onboard(phone, "password_invalid")
+            continue
+        except FloodWaitError as exc:
+            report_onboard(phone, "flood", f"Telegram 限流 {exc.seconds} 秒")
+            await _drop_onboard_client(acct)
+            return False
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[%s] QR 2FA sign-in failed: %s", phone, exc)
+            report_onboard(phone, "failed", str(exc))
+            await _drop_onboard_client(acct)
+            return False
+
+
+async def run_qr_onboard(acct: Acct) -> None:
+    """QR-login onboarding as a background task: send QR photos to
+    the owner until one is scanned (30 s each, up to QR_MAX_REFRESH
+    regenerations), handle 2FA, verify the scanned account's phone,
+    then hand over to _finish_onboard. Runs as an asyncio task so
+    the main loop (session checks, code alerts, polls) never blocks;
+    process_onboard cancels it when the onboard record disappears
+    (停止扫码登录 button) or is cancelled (/cancel_add)."""
+    phone = acct.phone
+    try:
+        await _ensure_onboard_client(acct)
+        client = acct.client
+        if client is None:
+            report_onboard(phone, "failed", "监控端没能创建登录会话")
+            return
+        if await client.is_user_authorized():
+            # Session already authorized (e.g. restored): still verify
+            # it belongs to this phone before adopting it.
+            me = await client.get_me()
+            if norm_phone(getattr(me, "phone", "")) != phone:
+                log.warning("[%s] QR onboarding found a different account authorized; logging out.", phone)
+                try:
+                    await client.log_out()
+                except Exception:  # noqa: BLE001
+                    pass
+                report_onboard(phone, "failed", "扫码登录的是另一个账号，已自动退出")
+                await _drop_onboard_client(acct)
+                return
+            await _finish_onboard(acct)
+            return
+        refreshes = 0
+        while True:
+            qr = await client.qr_login()
+            caption = (
+                f"📷 账号【{acct.label}】扫码登录（第 {refreshes + 1} 张）\n"
+                f"30 秒内扫码，过期自动刷新（最多刷新 {QR_MAX_REFRESH} 次）。\n"
+                "用这个账号的 Telegram：设置 → 设备 → 链接桌面设备。"
+            )
+            send_qr_photo(_qr_png(qr.url), caption, phone)
+            try:
+                await qr.wait(timeout=QR_WAIT_TIMEOUT)
+                break
+            except SessionPasswordNeededError:
+                if not await _qr_2fa(acct, client):
+                    return
+                break
+            except (asyncio.TimeoutError, AuthTokenExpiredError):
+                refreshes += 1
+                if refreshes > QR_MAX_REFRESH:
+                    log.warning("[%s] QR onboarding gave up after %d refreshes.", phone, QR_MAX_REFRESH)
+                    report_onboard(phone, "failed", f"二维码刷新 {QR_MAX_REFRESH} 次都过期了还没扫上")
+                    await _drop_onboard_client(acct)
+                    return
+                continue
+        me = await client.get_me()
+        if norm_phone(getattr(me, "phone", "")) != phone:
+            log.warning("[%s] QR login authorized a different account; logging out.", phone)
+            try:
+                await client.log_out()
+            except Exception:  # noqa: BLE001
+                pass
+            report_onboard(phone, "failed", "扫码登录的是另一个账号，已自动退出")
+            await _drop_onboard_client(acct)
+            return
+        await _finish_onboard(acct)
+    except asyncio.CancelledError:
+        log.info("[%s] QR onboarding stopped.", phone)
+        await _drop_onboard_client(acct)
+        raise
+    except FloodWaitError as exc:
+        report_onboard(phone, "flood", f"Telegram 限流 {exc.seconds} 秒")
+        await _drop_onboard_client(acct)
+    except Exception as exc:  # noqa: BLE001 - a QR failure must not kill the monitor
+        log.warning("[%s] QR onboarding failed: %s", phone, exc)
+        report_onboard(phone, "failed", str(exc))
+        await _drop_onboard_client(acct)
+    finally:
+        if acct.qr_task is asyncio.current_task():
+            acct.qr_task = None
+
+
+def _ensure_qr_task(acct: Acct, item: dict) -> None:
+    """Start the QR onboarding task for this record if it is not
+    already running. A task that already ran for this exact record
+    (same created_at) is not restarted, so a persistent failure
+    cannot loop QR photos forever; re-running /add_account creates a
+    fresh record and starts again."""
+    task = getattr(acct, "qr_task", None)
+    if task is not None and not task.done():
+        return
+    created = str(item.get("created_at", "") or "")
+    if acct.qr_task_record is not None and acct.qr_task_record == created:
+        return
+    acct.qr_task_record = created
+    acct.qr_task = asyncio.create_task(run_qr_onboard(acct))
+
+
 async def _finish_onboard(acct: Acct) -> None:
     """The onboard client is now authorized: it becomes the account's
     monitoring client."""
@@ -1769,8 +1969,19 @@ async def process_onboard(data: dict) -> None:
     code the owner sends via /code, then with the 2FA password via /2fa.
     The code / password arrive in this /pending payload and are consumed
     on read by the Worker, so each is used at most once here; they are
-    kept in memory only and never logged."""
-    for item in data.get("onboard", []) or []:
+    kept in memory only and never logged. Records in the
+    choose_method state wait for the owner's 短信/扫码 tap; QR records
+    (mode="qr") run as background tasks (run_qr_onboard)."""
+    items = data.get("onboard", []) or []
+    # QR tasks whose record disappeared (the 停止扫码登录 button
+    # deletes it in the Worker) must stop and clean up their client.
+    onboard_phones = {norm_phone(o.get("phone", "")) for o in items}
+    for phone, acct in list(ACCOUNTS.items()):
+        task = getattr(acct, "qr_task", None)
+        if task is not None and not task.done() and norm_phone(phone) not in onboard_phones:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+    for item in items:
         phone = str(item.get("phone", "")).strip()
         if not phone:
             continue
@@ -1778,6 +1989,10 @@ async def process_onboard(data: dict) -> None:
         acct = ACCOUNTS.get(phone)
         if state == "cancelled":
             if acct is not None:
+                task = getattr(acct, "qr_task", None)
+                if task is not None and not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
                 await _drop_onboard_client(acct)
                 if not acct.authorized:
                     ACCOUNTS.pop(phone, None)
@@ -1787,6 +2002,16 @@ async def process_onboard(data: dict) -> None:
         if acct is None:
             acct = Acct(phone, str(item.get("name", "") or ""))
             ACCOUNTS[phone] = acct
+        mode = str(item.get("mode", "") or "")
+        if state == "choose_method":
+            continue  # owner has not picked 短信/扫码 yet
+        if mode == "qr":
+            if state == "password_received":
+                pw = str(item.get("password", "") or "")
+                if pw:
+                    acct.qr_password = pw
+            _ensure_qr_task(acct, item)
+            continue
         try:
             if state == "pending_send":
                 await _ensure_onboard_client(acct)
@@ -1971,6 +2196,8 @@ async def cleanup_accounts(data: dict) -> None:
     listed = {norm_phone(a.get("phone", "")) for a in data.get("accounts", []) or []}
     for phone in list(ACCOUNTS):
         acct = ACCOUNTS[phone]
+        if getattr(acct, "qr_task", None) is not None and not acct.qr_task.done():
+            continue  # QR task owns this client; process_onboard stops it
         if phone in removed and len(ACCOUNTS) > 1:
             log.info("[%s] Account removed by owner, dropping client and session file.", phone)
             await _drop_onboard_client(acct)

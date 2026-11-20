@@ -1,5 +1,5 @@
 /**
- * TG Guardian Worker v1.4.24
+ * TG Guardian Worker v1.4.25
  * Cloudflare Worker + KV (TG_GUARD_DATA) + Telegram Bot API.
  * Env: BOT_TOKEN, OWNER_ID, WEBHOOK_SECRET, KV binding TG_GUARD_DATA.
  * Author: TG https://t.me/ziixiix
@@ -15,7 +15,7 @@
  * tier (100k requests, 100k KV reads, 1k KV writes per day).
  *
  * Adding an account happens from the bot, no server change needed:
- *   /add_account <手机号> [名字]  -> monitor sends a login code
+ *   /add_account <手机号> [名字]  -> pick 短信登录 (login code) or 扫码登录 (QR)
  *   /code <验证码>               -> monitor finishes the login
  *   /2fa <二级密码>             -> only if the account has 2FA
  *   /cancel_add <手机号>         -> abort an in-progress add
@@ -198,9 +198,22 @@
  * and sustain triggers; alerts still go out and manual button taps
  * still work. (/alert_off only silences popups; this stops the
  * automatic actions themselves.)
+ *
+ * QR LOGIN (v1.4.25): /add_account now offers two ways to add an
+ * account - 短信登录 (the original login-code flow, unchanged) and
+ * 扫码登录 (QR). The onboard record carries mode (code|qr) and a
+ * choose_method state until the owner taps one of the two buttons
+ * (onboard:code:<phone> / onboard:qr:<phone>); GET /pending passes
+ * mode through to the monitor. QR needs two devices (one shows the
+ * code, one scans) and each QR is valid 30 s, auto-refreshed up to
+ * 10 times by the monitor, which sends the QR photos itself. The
+ * 停止扫码登录 button under each photo (onboard:qr_stop:<phone>)
+ * deletes the onboard record; the monitor stops the QR task when
+ * the record disappears. /remove_account no longer refuses to
+ * delete the last account; zero accounts is a valid state.
  */
 
-const VERSION = "1.4.24";
+const VERSION = "1.4.25";
 
 // Wake-up marker (v1.4.9): sent as a short bot message after any decision
 // button tap so the monitor polls /pending immediately instead of waiting
@@ -401,7 +414,7 @@ async function migrateLegacyKeys(env, phone) {
   } catch { /* ignore */ }
 }
 
-// --- Onboard records: KV "onboard" = [{phone, name, state, created_at,
+// --- Onboard records: KV "onboard" = [{phone, name, state, mode?, created_at,
 // detail?, code?, password?}]. The code/password are stripped from the
 // stored record the moment GET /pending hands them to the monitor. ---
 async function getOnboard(env) {
@@ -477,7 +490,7 @@ const HELP_TEXT =
   "🛡️ TG Guardian（多账号）\n\n" +
   "👥 账号管理\n" +
   "/accounts — 账号列表和状态\n" +
-  "/add_account <手机号> [名字] — 添加一个账号\n" +
+  "/add_account <手机号> [名字] — 添加一个账号（短信登录/扫码登录）\n" +
   "/rename_account [手机号或名字] <新名字> — 改账号名字\n" +
   "/change_phone <旧手机号> <新手机号> — 在 Telegram 换了号码后，把记录迁到新号码\n" +
   "/code <验证码> — 添加账号时提交验证码\n" +
@@ -530,7 +543,7 @@ const KEYBOARD = {
 const BOT_COMMANDS = [
   { command: "start", description: "启动机器人" },
   { command: "accounts", description: "账号列表和状态" },
-  { command: "add_account", description: "添加一个账号" },
+  { command: "add_account", description: "添加一个账号（短信/扫码）" },
   { command: "code", description: "添加账号时提交验证码" },
   { command: "2fa", description: "添加账号时提交二级密码" },
   { command: "cancel_add", description: "取消正在添加的账号" },
@@ -1028,6 +1041,8 @@ async function runCommand(env, chatId, fromId, rawText) {
       for (const o of onboard) {
         const stateText = {
           pending_send: "正在发验证码…",
+          choose_method: "等你选登录方式（短信/扫码）",
+          qr_pending: "扫码登录中，等你扫码",
           code_sent: "验证码已发出，等你发 /code",
           code_received: "验证码已收到，正在登录…",
           code_invalid: "验证码不对，等你重发 /code",
@@ -1058,12 +1073,15 @@ async function runCommand(env, chatId, fromId, rawText) {
     if (existing) {
       return sendMessage(env, chatId, `账号 ${displayPhone(phone)} 正在添加中，当前状态：${existing.state}。\n取消请发 /cancel_add ${displayPhone(phone)}`, true);
     }
-    onboard.push({ phone, name, state: "pending_send", created_at: new Date().toISOString() });
+    onboard.push({ phone, name, state: "choose_method", created_at: new Date().toISOString() });
     await saveOnboard(env, onboard);
     return sendMessage(env, chatId,
-      `已登记账号 ${displayPhone(phone)}${name ? "（" + name + "）" : ""}，监控端正在发验证码（最多 1 分钟）。\n` +
-      "收到验证码后发给我：/code <验证码>\n\n" +
-      "注意：验证码和二级密码只经过机器人中转，监控端收到就用、用完就删，不会存下来。", true);
+      `已登记账号 ${displayPhone(phone)}${name ? "（" + name + "）" : ""}。\n选一种登录方式：`,
+      true,
+      { inline_keyboard: [[
+        { text: "📩 短信登录", callback_data: `onboard:code:${phone}` },
+        { text: "📷 扫码登录", callback_data: `onboard:qr:${phone}` },
+      ]] });
   }
   if (cmd === "/code") {
     const code = (args[0] || "").replace(/[^0-9]/g, "");
@@ -1124,15 +1142,12 @@ async function runCommand(env, chatId, fromId, rawText) {
     if (!acct) {
       return sendMessage(env, chatId, `没找到账号 ${displayPhone(phone)}，发 /accounts 看看已有的账号。`, true);
     }
-    if (accounts.length <= 1) {
-      return sendMessage(env, chatId, "至少要保留一个账号，不能删掉最后一个。", true);
-    }
     const confirm = args[1] === "确认";
     if (!confirm) {
       await kvPut(env, "pending_removal", JSON.stringify({ phone, at: Date.now() }));
       return sendMessage(env, chatId,
         `确定要删除账号 ${accountLabel(acct)}（${displayPhone(phone)}）吗？\n` +
-        "会清掉：待确认记录、冻结记录、告警、设置、设备快照，监控端也会删掉它的会话文件。\n\n" +
+        "⚠️ 删除后，这个账号已记录的状态（设置、冻结记录、告警、快照、会话备份）全部清掉，监控端也会删掉会话文件；重新添加后，新会话 24 小时内不能注销其他设备。\n\n" +
         `确认删除请再发一次：/remove_account ${displayPhone(phone)} 确认`, true);
     }
     let pend = null;
@@ -2112,6 +2127,9 @@ if (data.startsWith("sustain_flood_off:")) { const phone = normalizePhone((data.
 if (data.startsWith("sustain_mode:loop:")) { const phone = normalizePhone((data.split(":")[2] || '')); const s = phone ? await setSustainMode(env, phone, "loop") : null; if (s) { await answerCallback(env, cb.id, "已改成循环"); await sendMessage(env, cb.message.chat.id, `🔁 持续Flood保护已改成循环【${displayPhone(phone)}】\n每 ${s.minutes} 分钟触发一次 Flood 保护，一直循环，直到用 /sustain_flood_off 取消。\n下次触发：${fmtTime(s.trigger_at)}。`, true); } else { await answerCallback(env, cb.id, "先设置一个时间"); } return; }
 if (data.startsWith("sustain_mode:count:")) { const phone = normalizePhone((data.split(":")[2] || '')); const s = phone ? await getSustain(env, phone) : null; if (s) { await answerCallback(env, cb.id, "选次数"); await sendMessage(env, cb.message.chat.id, `🔢 持续Flood保护【${displayPhone(phone)}】\n每 ${s.minutes} 分钟触发一次，选一共触发几次，到次数就自动停止。`, true, sustainCountKeyboard(phone)); } else { await answerCallback(env, cb.id, "先设置一个时间"); } return; }
 if (data.startsWith("sustain_count:")) { const parts = data.split(":"); const n = parseInt(parts[1] || '', 10); const phone = normalizePhone(parts[2] || ''); const s = (phone && n >= 1 && n <= 100) ? await setSustainMode(env, phone, "count", n) : null; if (s) { await answerCallback(env, cb.id, `共 ${n} 次`); await sendMessage(env, cb.message.chat.id, `🔢 持续Flood保护已设置【${displayPhone(phone)}】\n每 ${s.minutes} 分钟触发一次 Flood 保护，共 ${n} 次，到次数自动停止。\n下次触发：${fmtTime(s.trigger_at)}。`, true); } else { await answerCallback(env, cb.id, "次数无效"); } return; }
+if (data.startsWith("onboard:qr_stop:")) { const phone = normalizePhone(data.slice("onboard:qr_stop:".length)); const onboard = phone ? await getOnboard(env) : []; const item = onboard.find((o) => o.phone === phone); if (item) { await saveOnboard(env, onboard.filter((o) => o.phone !== phone)); await answerCallback(env, cb.id, "已停止扫码登录"); await sendMessage(env, cb.message.chat.id, `🛑 已停止扫码登录【${displayPhone(phone)}】。重新添加发 /add_account ${displayPhone(phone)}。`, true); ctx.waitUntil(sendWakeup(env)); } else { await answerCallback(env, cb.id, "已经结束了"); } return; }
+if (data.startsWith("onboard:code:")) { const phone = normalizePhone(data.slice("onboard:code:".length)); const onboard = phone ? await getOnboard(env) : []; const item = onboard.find((o) => o.phone === phone); if (item && item.state === "choose_method") { item.mode = "code"; item.state = "pending_send"; await saveOnboard(env, onboard); await answerCallback(env, cb.id, "短信登录"); await sendMessage(env, cb.message.chat.id, `已登记账号 ${displayPhone(phone)}${item.name ? "（" + item.name + "）" : ""}，监控端正在发验证码（最多 1 分钟）。\n收到验证码后发给我：/code <验证码>\n\n注意：验证码和二级密码只经过机器人中转，监控端收到就用、用完就删，不会存下来。`, true); ctx.waitUntil(sendWakeup(env)); } else { await answerCallback(env, cb.id, "这个添加已经处理过了"); } return; }
+if (data.startsWith("onboard:qr:")) { const phone = normalizePhone(data.slice("onboard:qr:".length)); const onboard = phone ? await getOnboard(env) : []; const item = onboard.find((o) => o.phone === phone); if (item && item.state === "choose_method") { item.mode = "qr"; item.state = "qr_pending"; await saveOnboard(env, onboard); await answerCallback(env, cb.id, "扫码登录"); await sendMessage(env, cb.message.chat.id, `📷 扫码登录【${displayPhone(phone)}】\n需要两个设备：一台显示二维码、一台扫码。\n二维码 30 秒有效，过期自动刷新（最多 10 次）。\n监控端马上发二维码，请用这个账号的 Telegram 扫（设置 → 设备 → 链接桌面设备）。\n取消：点二维码下的「停止扫码登录」，或发 /cancel_add ${displayPhone(phone)}`, true); ctx.waitUntil(sendWakeup(env)); } else { await answerCallback(env, cb.id, "这个添加已经处理过了"); } return; }
 const cmd = data.startsWith("cmd:")? data.slice(4): data;
 await answerCallback(env, cb.id);
 await runCommand(env, cb.message.chat.id, cb.from.id, cmd);
