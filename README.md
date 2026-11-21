@@ -13,6 +13,9 @@
 - **持续 Flood 保护**：定时触发一次 Flood 保护，可以只触发一次、每隔一段时间循环触发、或者触发指定次数后停止。
 - **多账号**：一个机器人可以同时看住你名下的多个 Telegram 账号（共用一个 API ID / Hash）。
 - **改账号显示名**：机器人里显示的账号名字可以自定义（`/rename_account`），名字不能重复。
+- **添加账号（短信 / 扫码）**：`/add_account` 可以选短信登录或扫码登录；扫码需要两个设备（一台显示二维码、一台扫码），二维码 30 秒有效、最多自动刷新 10 次，点“停止扫码登录”或发 `/stop_qr` 可以停。
+- **暂停保护**：`/pause_guard [账号] [分钟]` 可以暂停全部或单个账号的自动注销 / 自动冻结（不填分钟 = 一直暂停，填分钟 = 到点自动恢复）；暂停期间告警照常发、按钮手动点照常生效，`/resume_guard [账号]` 恢复。
+- **换号码迁移**：在 Telegram 里换了手机号后，用 `/change_phone <旧手机号> <新手机号>` 把 TG Guardian 里这个账号的记录迁到新号码。
 - **自检与状态**：`/status` 看账号和会话，`/devices` 看设备列表，`/security_check` 做安全检查，`/flood_status` 看 Flood 状态。
 
 ## 架构
@@ -81,7 +84,7 @@ Telegram 登录分两步：先请求验证码（发到你的 Telegram 应用内�
    ```
    你的 Worker 地址形如 `https://tg-guardian.<你的子域名>.workers.dev`（子域名在 Cloudflare Dashboard 的 Workers 页面能看到）。
    返回 `{"ok":true,...}` 就是成功。
-7. 验证：打开 `https://<你的Worker地址>/`，应该看到 `{"ok":true,"service":"TG Guardian","version":"1.4.17",...}`，并且 `checks` 里的 `BOT_TOKEN`、`OWNER_ID`、`WEBHOOK_SECRET`、`TG_GUARD_DATA`、`KV_PUT`、`KV_GET` 全是 `true`。然后去 Telegram 给机器人发 `/start`，它应该回你菜单。
+7. 验证：打开 `https://<你的Worker地址>/`，应该看到 `{"ok":true,"service":"TG Guardian","version":"1.4.28",...}`，并且 `checks` 里的 `BOT_TOKEN`、`OWNER_ID`、`WEBHOOK_SECRET`、`TG_GUARD_DATA`、`KV_PUT`、`KV_GET` 全是 `true`。然后去 Telegram 给机器人发 `/start`，它应该回你菜单。
 
 ### 5. 部署监控端
 
@@ -107,7 +110,7 @@ Telegram 登录分两步：先请求验证码（发到你的 Telegram 应用内�
    ```
    第一次启动没有会话文件，它会在终端里问你要手机号和验证码（Telegram 发来的登录验证码），照着输就行。登录成功后会生成会话文件（`tg_guardian.session`），以后启动就不用再登录了。
    - 如果你不想交互登录，可以先用 Telethon 生成一个 `SESSION_STRING`（会话字符串），设到环境变量里，监控端启动时直接用它登录。
-4. 验证：机器人应该给你发一条“监控端已启动”的提醒，`/status` 能看到主账号的会话数。日志里出现 `TG Guardian MTProto monitor v0.5.16 started as ...` 就是正常启动。
+4. 验证：机器人应该给你发一条“监控端已启动”的提醒，`/status` 能看到主账号的会话数。日志里出现 `TG Guardian MTProto monitor v0.5.26 started as ...` 就是正常启动。
 
 ### 6. 添加账号
 
@@ -117,12 +120,16 @@ Telegram 登录分两步：先请求验证码（发到你的 Telegram 应用内�
 /add_account +8613800138000 小号
 ```
 
-然后按提示操作：
+机器人会让你选登录方式：
+
+- **短信登录**：然后按提示操作：
 
 ```
 /code 12345        # 填 Telegram 发给那个账号的验证码
 /2fa 你的二级密码    # 那个账号如果开了二级密码才需要
 ```
+
+- **扫码登录**：需要两个设备（一台显示二维码、一台扫码）；二维码 30 秒有效、最多自动刷新 10 次；不想扫了点“停止扫码登录”，或发 `/stop_qr [账号]` 停止。开了二级密码的账号扫码后同样用 `/2fa` 提交。
 
 加完后 `/accounts` 能看到所有账号。想删账号：`/remove_account +8613800138000`，再发一次带 `确认`。
 
@@ -145,7 +152,10 @@ Telegram 登录分两步：先请求验证码（发到你的 Telegram 应用内�
 | `/flood_status` | 看 Flood 状态和预计恢复时间 |
 | `/security_check` | 安全自检 |
 | `/accounts` | 账号列表 |
-| `/add_account <手机号> [名字]` | 添加一个账号 |
+| `/add_account <手机号> [名字]` | 添加一个账号（短信登录 / 扫码登录） |
+| `/stop_qr [账号]` | 停止扫码登录 |
+| `/change_phone <旧手机号> <新手机号>` | 在 Telegram 换了号码后，把记录迁到新号码 |
+| `/security` | 安全状态 |
 | `/code <验证码>` | 完成添加账号时的验证码 |
 | `/2fa <二级密码>` | 完成添加账号时的二级密码 |
 | `/cancel_add <手机号>` | 取消正在添加的账号 |
@@ -154,11 +164,16 @@ Telegram 登录分两步：先请求验证码（发到你的 Telegram 应用内�
 | `/set_guard <秒>` | 验证码提醒后多久无操作自动冻结（60–3600 秒） |
 | `/set_revoke <秒>` | 新设备提醒后多久无操作自动注销（60–3600 秒） |
 | `/alert_on [账号]` / `/alert_off [账号]` | 开 / 关提醒弹窗（只关弹窗，保护照常运行） |
+| `/pause_guard [账号] [分钟]` | 暂停保护（不填 = 所有账号一直暂停；填分钟 = 到点自动恢复） |
+| `/resume_guard [账号]` | 恢复保护 |
 | `/clear_alerts [账号]` | 清空提醒记录 |
 | `/clear_flood [账号]` | 手动清除一条 Flood 记录 |
 | `/check_flood [账号]` | 手动探测 Flood 是不是已经解除了（可能会收到一次验证码，忽略即可） |
 | `/sustain_flood_on [分钟] [账号]` | 开启持续 Flood 保护（默认 30 分钟，最长 1440 分钟） |
 | `/sustain_flood_off [账号]` | 关闭持续 Flood 保护 |
+| `/test` | KV 读写测试 |
+| `/ping` | 机器人是否在线 |
+| `/start` | 启动机器人 |
 | `/help` | 帮助 |
 
 持续 Flood 保护的三种模式（设好时间后，在机器人弹出的按钮里选）：
@@ -192,6 +207,7 @@ Telegram 登录分两步：先请求验证码（发到你的 Telegram 应用内�
 | `PHONE` | 文本 · 字符串 | 主账号手机号，带国家码，如 `+8613800138000` | 必填 |
 | `WORKER_URL` | 文本 · 字符串 | 你的 Worker 地址，如 `https://tg-guardian.<你的子域名>.workers.dev` | 必填 |
 | `SESSION_STRING` | 密钥 · 字符串 | Telethon 会话字符串；填了它启动时就不用交互登录 | 可选 |
+| `SESSION_STRING_<手机号>` | 密钥 · 字符串 | 某个账号的会话字符串（手机号只写数字）；无状态容器（如 Northflank）重启后靠它恢复该账号的会话，监控端心跳也会把当前会话备份到 Worker KV | 可选 |
 | `CHECK_INTERVAL` | 文本 · 整数（秒） | 每隔多久检查一次授权会话，默认 300 | 可选 |
 | `POLL_INTERVAL` | 文本 · 整数（秒） | 每隔多久问一次 Worker 有没有新指令，默认 120 | 可选 |
 | `AUTO_REVOKE_AFTER` | 文本 · 整数（秒） | 新设备提醒后多久无操作自动注销，默认 600 | 可选 |
